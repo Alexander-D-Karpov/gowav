@@ -49,3 +49,16 @@ go build
 - [Bubble Tea](https://github.com/charmbracelet/bubbletea) - Terminal UI framework
 - [oto](https://github.com/hajimehoshi/oto) - Audio playback
 - [tag](https://github.com/dhowden/tag) - Metadata parsing
+
+
+## TODO:
+- loading folder with music
+- music conversion
+- music editing
+- music visualization
+- music streaming
+- loading from online sources
+- building graph of music (volume, power, etc)
+- better UI (more interactive, more information, more customization)
+- better audio support (more formats, more options)
+- better metadata support (more formats, more options)

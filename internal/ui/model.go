@@ -94,7 +94,7 @@ func NewModel() Model {
 		style:          style,
 		history:        make([]string, 0),
 		historyPos:     -1,
-		mainOutput:     "Welcome to Music Processor! Type 'help' for commands.\nPress '?' to show keyboard shortcuts.",
+		mainOutput:     "Welcome to gowav! Type 'help' for commands.\nPress '?' to show keyboard shortcuts.",
 		lastUpdateTime: time.Now(),
 		uiMode:         ModeFull,
 		shortcuts:      shortcuts,
