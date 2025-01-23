@@ -73,7 +73,11 @@ func formatSearchResults(songs []Song) string {
 
 	for i, song := range songs {
 		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, song.Name))
-		sb.WriteString(fmt.Sprintf("   Artist: %s\n", song.Authors[0].Name))
+		if len(song.Authors) > 0 {
+			sb.WriteString(fmt.Sprintf("   Artist: %s\n", song.Authors[0].Name))
+		} else {
+			sb.WriteString("   Artist: Unknown\n")
+		}
 		sb.WriteString(fmt.Sprintf("   Album: %s\n", song.Album.Name))
 		sb.WriteString(fmt.Sprintf("   Duration: %d seconds\n", song.Length))
 		sb.WriteString(fmt.Sprintf("   URL: %s\n\n", song.File))

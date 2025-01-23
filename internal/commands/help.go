@@ -12,8 +12,7 @@ load, l <path>   Load audio file from path or URL
 search, s <query> Search for tracks
 quit, q, exit    Exit application
 
-Commands can be used with or without a colon prefix (:)
-Example: Both "help" and ":help" will work`
+(type 'help' for more info)`
 
 	return help, nil, nil
 }
@@ -25,9 +24,16 @@ info, i          Show detailed track information
 play, p          Play current track
 pause            Pause playback
 stop             Stop playback
-artwork          Show album artwork in ASCII art
-unload           Unload current track and return to normal mode
-help, h          Show this help message`
+artwork          Show album artwork in ASCII
+unload           Unload current track, return to normal mode
 
+viz wave         Waveform visualization
+viz spectrum     Frequency (Spectrogram) visualization
+viz tempo        Tempo/energy analysis
+viz density      Density map
+viz beat         Beat/rhythm patterns
+
+help, h          Show this help message
+`
 	return help, nil, nil
 }

@@ -2,77 +2,23 @@ package commands
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
-
 	tea "github.com/charmbracelet/bubbletea"
 	"gowav/internal/audio"
 	"gowav/pkg/api"
+	"os"
+	"path/filepath"
+	"strings"
 )
-
-type Mode int
-
-const (
-	ModeNormal Mode = iota
-	ModeTrack
-)
-
-type Track struct {
-	Title    string
-	Artist   string
-	Album    string
-	Duration time.Duration
-}
 
 type Commander struct {
-	player        *audio.Player
-	processor     *audio.Processor
-	apiClient     *api.Client
+	player       *audio.Player
+	processor    *audio.Processor
+	apiClient    *api.Client
+	mode         Mode
+	loadProgress float64
+	currentTrack *Track
+
 	searchResults []SearchResult
-	mode          Mode
-	currentTrack  *Track
-	loadProgress  float64
-}
-
-func (c *Commander) GetCurrentTrack() *Track {
-	if c.processor == nil || c.processor.GetMetadata() == nil {
-		return nil
-	}
-
-	metadata := c.processor.GetMetadata()
-	return &Track{
-		Title:    metadata.Title,
-		Artist:   metadata.Artist,
-		Album:    metadata.Album,
-		Duration: metadata.Duration,
-	}
-}
-
-func (c *Commander) GetPlaybackStatus() string {
-	if c.player == nil {
-		return ""
-	}
-
-	state := c.player.GetState()
-	position := c.player.GetPosition()
-	duration := c.player.GetDuration()
-
-	status := fmt.Sprintf("[%s] %s / %s",
-		formatPlaybackState(state),
-		formatDuration(position),
-		formatDuration(duration))
-
-	return status + "\n" + c.player.RenderTrackBar(60)
-}
-
-func (c *Commander) GetLoadingProgress() float64 {
-	return c.loadProgress
-}
-
-func (c *Commander) SetLoadingProgress(progress float64) {
-	c.loadProgress = progress
 }
 
 func NewCommander() *Commander {
@@ -80,6 +26,7 @@ func NewCommander() *Commander {
 		player:    audio.NewPlayer(),
 		processor: audio.NewProcessor(),
 		apiClient: api.NewClient(),
+		mode:      ModeNormal,
 	}
 }
 
@@ -87,17 +34,57 @@ func (c *Commander) IsInTrackMode() bool {
 	return c.mode == ModeTrack
 }
 
+func (c *Commander) GetProcessor() *audio.Processor {
+	return c.processor
+}
+
+func (c *Commander) GetCurrentTrack() *Track {
+	if c.processor == nil || c.processor.GetMetadata() == nil {
+		return nil
+	}
+	meta := c.processor.GetMetadata()
+	return &Track{
+		Title:    meta.Title,
+		Artist:   meta.Artist,
+		Album:    meta.Album,
+		Duration: int(meta.Duration.Seconds()),
+	}
+}
+
+func (c *Commander) GetPlaybackStatus() string {
+	if c.player == nil {
+		return ""
+	}
+	state := c.player.GetState()
+	position := c.player.GetPosition()
+	duration := c.player.GetDuration()
+
+	status := fmt.Sprintf("[%s] %s / %s",
+		formatPlaybackState(state),
+		FormatDuration(position),
+		FormatDuration(duration))
+
+	return status + "\n" + c.player.RenderTrackBar(60)
+}
+
+func (c *Commander) GetLoadingProgress() float64 {
+	return c.loadProgress
+}
+func (c *Commander) SetLoadingProgress(progress float64) {
+	c.loadProgress = progress
+}
+
 func (c *Commander) Execute(input string) (string, error, tea.Cmd) {
 	input = strings.TrimSpace(input)
 	input = strings.TrimPrefix(input, ":")
 
-	// Check if input is a direct file path
+	// If user typed a path => load
 	if strings.HasPrefix(input, "/") || strings.HasPrefix(input, "./") || strings.HasPrefix(input, "~/") {
 		path := strings.TrimSpace(input)
 		if strings.HasPrefix(path, "~/") {
-			homeDir, err := os.UserHomeDir()
+			home, err := os.UserHomeDir()
 			if err == nil {
-				path = filepath.Join(homeDir, path[2:])
+				path = filepath.Join(home, path[2:])
 			}
 		}
 		output, err := c.handleLoad(path)
@@ -115,5 +102,8 @@ func (c *Commander) Execute(input string) (string, error, tea.Cmd) {
 	cmd := strings.ToLower(parts[0])
 	args := parts[1:]
 
-	return c.handleCommand(cmd, args, c.mode)
+	if c.mode == ModeTrack {
+		return c.handleTrackCommand(cmd, args)
+	}
+	return c.handleNormalCommand(cmd, args)
 }

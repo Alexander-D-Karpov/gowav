@@ -1,39 +1,27 @@
 package ui
 
 import (
-	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	"time"
 )
 
+// streamMsg is a message that increments streaming progress or signals an error.
 type streamMsg struct {
 	url      string
 	progress float64
 	error    error
 }
 
-func (m Model) handleStreamStart(url string) tea.Cmd {
+func (m AudioModel) handleStreamStart(url string) tea.Cmd {
+	// Mark loading
+	m.loadingState.IsLoading = true
+	m.loadingState.Message = "Streaming..."
+	m.loadingState.CanCancel = true
+	m.loadingState.StartTime = time.Now()
+	m.loadingState.Progress = 0
+
+	// Return a command that sends a `streamMsg` to increment progress
 	return func() tea.Msg {
 		return streamMsg{url: url, progress: 0}
 	}
-}
-
-func (m Model) updateStreamProgress(msg streamMsg) (Model, tea.Cmd) {
-	if msg.error != nil {
-		m.loading = false
-		m.mainOutput = fmt.Sprintf("Streaming error: %v", msg.error)
-		return m, nil
-	}
-
-	m.loading = true
-	m.loadingMsg = fmt.Sprintf("Streaming from %s... %.0f%%", msg.url, msg.progress*100)
-
-	if msg.progress >= 1.0 {
-		m.loading = false
-		return m, nil
-	}
-
-	return m, tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
-		return streamMsg{url: msg.url, progress: msg.progress + 0.1}
-	})
 }

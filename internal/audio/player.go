@@ -1,5 +1,3 @@
-// internal/audio/player.go
-
 package audio
 
 import (
@@ -49,14 +47,14 @@ func (p *Player) Play(data []byte) error {
 	}
 
 	if p.context == nil {
-		context, err := oto.NewContext(p.sampleRate, p.numChannels, 2, 4096)
+		ctx, err := oto.NewContext(p.sampleRate, p.numChannels, 2, 8192)
 		if err != nil {
 			return fmt.Errorf("failed to create audio context: %w", err)
 		}
-		p.context = context
+		p.context = ctx
 	}
 
-	// Create a new player for the audio
+	// Handle pause/resume vs new playback
 	if p.state != StatePaused {
 		if p.player != nil {
 			p.player.Close()
@@ -65,7 +63,7 @@ func (p *Player) Play(data []byte) error {
 		p.buffer = data
 		_, err := p.player.Write(data)
 		if err != nil {
-			return fmt.Errorf("failed to write audio data: %w", err)
+			return fmt.Errorf("failed to write to player: %w", err)
 		}
 	}
 
@@ -82,10 +80,8 @@ func (p *Player) Pause() error {
 		return nil
 	}
 
-	// Store current position
 	p.updatePosition()
 
-	// Close current player
 	if p.player != nil {
 		p.player.Close()
 		p.player = nil
@@ -107,7 +103,6 @@ func (p *Player) Stop() error {
 	p.buffer = nil
 	p.state = StateStopped
 	p.position = 0
-
 	return nil
 }
 
@@ -120,7 +115,6 @@ func (p *Player) GetState() PlaybackState {
 func (p *Player) GetPosition() time.Duration {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-
 	if p.state == StatePlaying {
 		p.updatePosition()
 	}
@@ -152,7 +146,6 @@ func (p *Player) RenderTrackBar(width int) string {
 	if p.state == StateStopped {
 		return ""
 	}
-
 	p.updatePosition()
 
 	progress := float64(p.position) / float64(p.duration)
@@ -160,7 +153,10 @@ func (p *Player) RenderTrackBar(width int) string {
 		progress = 1.0
 	}
 
-	barWidth := width - 20
+	barWidth := width - 20 // Leave space for time display
+	if barWidth < 1 {
+		barWidth = 1
+	}
 	completed := int(float64(barWidth) * progress)
 
 	var bar strings.Builder
@@ -185,12 +181,4 @@ func (p *Player) RenderTrackBar(width int) string {
 	bar.WriteString(fmt.Sprintf("] %s/%s", posStr, durStr))
 
 	return bar.String()
-}
-
-func formatDuration(d time.Duration) string {
-	d = d.Round(time.Second)
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-	return fmt.Sprintf("%02d:%02d", m, s)
 }

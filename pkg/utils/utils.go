@@ -24,37 +24,32 @@ var MagicNumbers = map[string][]byte{
 	"flac": {0x66, 0x4C, 0x61, 0x43}, // fLaC
 	"wav":  {0x52, 0x49, 0x46, 0x46}, // RIFF
 	"ogg":  {0x4F, 0x67, 0x67, 0x53}, // OggS
-	"m4a":  {0x66, 0x74, 0x79, 0x70}, // ftyp (after 4 bytes)
+	"m4a":  {0x66, 0x74, 0x79, 0x70}, // ftyp
 }
 
 func IsMusicFile(path string) bool {
-	// First check extension
 	ext := strings.ToLower(filepath.Ext(path))
 	if !MusicExtensions[ext] {
 		return false
 	}
 
-	// Then check magic numbers
 	file, err := os.Open(path)
 	if err != nil {
 		return false
 	}
 	defer file.Close()
 
-	// Read first 8 bytes (enough for all our magic numbers)
 	header := make([]byte, 8)
 	n, err := file.Read(header)
 	if err != nil || n < 8 {
 		return false
 	}
 
-	// Check MIME type
 	mimeType := http.DetectContentType(header)
 	if strings.HasPrefix(mimeType, "audio/") {
 		return true
 	}
 
-	// Check magic numbers as fallback
 	for _, magic := range MagicNumbers {
 		if len(magic) <= len(header) {
 			matches := true
@@ -90,18 +85,15 @@ func GetCompletions(partialPath string) []string {
 		name := entry.Name()
 		fullPath := filepath.Join(dir, name)
 
-		// Skip if doesn't match prefix
 		if !strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
 			continue
 		}
 
-		// Always include directories
 		if entry.IsDir() {
 			completions = append(completions, fullPath+string(os.PathSeparator))
 			continue
 		}
 
-		// For files, only include music files
 		if IsMusicFile(fullPath) {
 			completions = append(completions, fullPath)
 		}

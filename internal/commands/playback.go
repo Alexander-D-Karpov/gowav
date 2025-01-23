@@ -7,29 +7,23 @@ import (
 	"time"
 )
 
-type playbackUpdateMsg struct{}
-
 func (c *Commander) handlePlay() (string, error, tea.Cmd) {
 	if c.processor == nil || c.processor.GetCurrentFile() == nil {
 		return "", fmt.Errorf("no track loaded"), nil
 	}
-
 	if err := c.player.Play(c.processor.GetCurrentFile()); err != nil {
 		return "", fmt.Errorf("failed to play: %w", err), nil
 	}
-
 	return "Playing...", nil, c.startPlaybackUpdates()
 }
 
 func (c *Commander) handlePause() (string, error, tea.Cmd) {
 	if c.player.GetState() != audio.StatePlaying {
-		return "", fmt.Errorf("no track is playing"), nil
+		return "", fmt.Errorf("no track is currently playing"), nil
 	}
-
 	if err := c.player.Pause(); err != nil {
 		return "", fmt.Errorf("failed to pause: %w", err), nil
 	}
-
 	return "Paused", nil, nil
 }
 
@@ -37,7 +31,6 @@ func (c *Commander) handleStop() (string, error, tea.Cmd) {
 	if err := c.player.Stop(); err != nil {
 		return "", fmt.Errorf("failed to stop: %w", err), nil
 	}
-
 	return "Stopped", nil, nil
 }
 
@@ -56,12 +49,4 @@ func formatPlaybackState(state audio.PlaybackState) string {
 	default:
 		return "Stopped"
 	}
-}
-
-func formatDuration(d time.Duration) string {
-	d = d.Round(time.Second)
-	m := d / time.Minute
-	d -= m * time.Minute
-	s := d / time.Second
-	return fmt.Sprintf("%02d:%02d", m, s)
 }

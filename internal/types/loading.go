@@ -1,4 +1,4 @@
-package commands
+package types
 
 import (
 	"fmt"
@@ -7,12 +7,12 @@ import (
 )
 
 type LoadingState struct {
-	Progress    float64
+	IsLoading   bool
 	Message     string
+	Progress    float64
 	StartTime   time.Time
 	FileSize    int64
 	BytesLoaded int64
-	IsLoading   bool
 	CanCancel   bool
 	mu          sync.RWMutex
 }
@@ -21,9 +21,10 @@ func (s *LoadingState) UpdateProgress(loaded int64, total int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.BytesLoaded = loaded
-	s.FileSize = total
-	if total > 0 {
+	// Only update if we have valid values
+	if loaded >= 0 && total > 0 {
+		s.BytesLoaded = loaded
+		s.FileSize = total
 		s.Progress = float64(loaded) / float64(total)
 	}
 }
@@ -32,18 +33,19 @@ func (s *LoadingState) GetETA() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.Progress <= 0 || s.Progress >= 1 {
-		return "calculating..."
+	// Return empty string if we don't have enough data
+	if s.BytesLoaded == 0 || s.FileSize == 0 {
+		return ""
 	}
 
 	elapsed := time.Since(s.StartTime)
 	if elapsed <= 0 {
-		return "calculating..."
+		return ""
 	}
 
 	rate := float64(s.BytesLoaded) / elapsed.Seconds()
 	if rate <= 0 {
-		return "calculating..."
+		return ""
 	}
 
 	remaining := float64(s.FileSize-s.BytesLoaded) / rate
@@ -55,14 +57,4 @@ func (s *LoadingState) GetETA() string {
 		return fmt.Sprintf("%.1f minutes", eta.Minutes())
 	}
 	return fmt.Sprintf("%.0f seconds", eta.Seconds())
-}
-
-// handleLoad starts the asynchronous load of a local file or URL.
-func (c *Commander) handleLoad(path string) (string, error) {
-	err := c.processor.LoadFile(path)
-	if err != nil {
-		return "", err
-	}
-	// We only confirm that loading started. The UI will show the spinner/progress/ETA while loading.
-	return fmt.Sprintf("Started loading file: %s\nPress Ctrl+C to cancel...", path), nil
 }
