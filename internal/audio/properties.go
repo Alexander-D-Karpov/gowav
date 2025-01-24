@@ -1,9 +1,10 @@
 package audio
 
 import (
-	"github.com/hajimehoshi/go-mp3"
 	"io"
 	"time"
+
+	"github.com/hajimehoshi/go-mp3"
 )
 
 type AudioProperties struct {
@@ -16,37 +17,32 @@ type AudioProperties struct {
 func extractAudioProperties(reader io.ReadSeeker) (AudioProperties, error) {
 	props := AudioProperties{}
 
-	// Try MP3 decoder first
-	decoder, err := mp3.NewDecoder(reader)
+	// MP3 decode approach.
+	dec, err := mp3.NewDecoder(reader)
 	if err == nil {
-		sampleRate := int64(decoder.SampleRate())
-		props.SampleRate = decoder.SampleRate()
+		props.SampleRate = dec.SampleRate()
 		props.Channels = 2
-		props.Duration = time.Duration(decoder.Length()) * time.Second / time.Duration(sampleRate)
 
-		// Calculate bitrate based on file size and duration
-		reader.Seek(0, io.SeekEnd)
-		size, _ := reader.Seek(0, io.SeekCurrent)
-		reader.Seek(0, io.SeekStart)
-
-		if props.Duration > 0 {
-			bitrate := int64(size*8) * sampleRate / decoder.Length()
-			props.BitRate = int(bitrate / 1000)
-		} else {
-			props.BitRate = 320 // Default assumption
+		// Fully read to get the total sample count.
+		var totalPCMFrames int64
+		buf := make([]byte, 8192)
+		for {
+			n, readErr := dec.Read(buf)
+			if n > 0 {
+				totalPCMFrames += int64(n / 4) // 4 bytes per stereo frame
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return props, readErr
+			}
 		}
-
+		durSeconds := float64(totalPCMFrames) / float64(props.SampleRate)
+		props.Duration = time.Duration(durSeconds * float64(time.Second))
 		return props, nil
 	}
 
-	// Reset reader position
-	reader.Seek(0, io.SeekStart)
-
-	// Fallback to sensible defaults
-	props.Duration = time.Duration(0)
-	props.SampleRate = 44100
-	props.Channels = 2
-	props.BitRate = 320
-
+	// If not MP3 or decode fails, return defaults (further expansions can be added for FLAC, OGG, etc.).
 	return props, nil
 }

@@ -3,27 +3,25 @@ package audio
 import (
 	"bytes"
 	"fmt"
-	"github.com/dhowden/tag"
-	"github.com/hajimehoshi/go-mp3"
 	"image"
 	"io"
 	"strings"
 	"time"
+
+	"github.com/dhowden/tag"
+	"github.com/hajimehoshi/go-mp3"
 )
 
 type Metadata struct {
-	// Basic tags
-	Title      string
-	Artist     string
-	Album      string
-	Year       int
-	Genre      string
-	Track      string
-	TrackTotal string
-	Disc       string
-	DiscTotal  string
-
-	// Extended tags
+	Title       string
+	Artist      string
+	Album       string
+	Year        int
+	Genre       string
+	Track       string
+	TrackTotal  string
+	Disc        string
+	DiscTotal   string
 	AlbumArtist string
 	Composer    string
 	Conductor   string
@@ -34,12 +32,9 @@ type Metadata struct {
 	Language    string
 	Comment     string
 	Lyrics      string
-
-	// Additional fields
 	BPM         string
 	ReleaseDate string
 
-	// Technical details
 	Duration        time.Duration
 	BitRate         int
 	SampleRate      int
@@ -49,7 +44,6 @@ type Metadata struct {
 	Encoder         string
 	EncoderSettings string
 
-	// Artwork
 	HasArtwork  bool
 	ArtworkMIME string
 	ArtworkSize image.Point
@@ -57,115 +51,116 @@ type Metadata struct {
 }
 
 func ExtractMetadata(data []byte) (*Metadata, error) {
+	// First pass: read tags.
 	reader := bytes.NewReader(data)
-
-	// First get tag info
-	m, err := tag.ReadFrom(reader)
+	meta, err := tag.ReadFrom(reader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read metadata: %w", err)
+		return nil, fmt.Errorf("failed reading tags: %w", err)
 	}
 
-	// Reset reader position for MP3 decoder
-	reader.Seek(0, io.SeekStart)
-	decoder, err := mp3.NewDecoder(reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create MP3 decoder: %w", err)
-	}
-
-	// Get duration in samples and convert to time
-	samples := decoder.Length()
-	sampleRate := decoder.SampleRate()
-	duration := time.Duration(float64(samples) / float64(sampleRate) * float64(time.Second))
-	bitRate := int(float64(len(data)) * 8 / duration.Seconds() / 1000)
-
-	trackNum, trackTotal := m.Track()
-	discNum, discTotal := m.Disc()
-
-	metadata := &Metadata{
-		Title:       m.Title(),
-		Artist:      m.Artist(),
-		Album:       m.Album(),
-		AlbumArtist: m.AlbumArtist(),
-		Year:        m.Year(),
-		Genre:       m.Genre(),
+	// Collect basic tag info.
+	trackNum, trackTotal := meta.Track()
+	discNum, discTotal := meta.Disc()
+	m := &Metadata{
+		Title:       meta.Title(),
+		Artist:      meta.Artist(),
+		Album:       meta.Album(),
+		AlbumArtist: meta.AlbumArtist(),
+		Year:        meta.Year(),
+		Genre:       meta.Genre(),
 		Track:       fmt.Sprintf("%d", trackNum),
 		TrackTotal:  fmt.Sprintf("%d", trackTotal),
 		Disc:        fmt.Sprintf("%d", discNum),
 		DiscTotal:   fmt.Sprintf("%d", discTotal),
-		Duration:    duration,
-		BitRate:     bitRate,
-		SampleRate:  sampleRate,
-		Channels:    2,
 		FileSize:    int64(len(data)),
+		Channels:    2, // By default. We'll confirm when decoding.
+		SampleRate:  44100,
 	}
 
-	// Get artwork - check both direct Picture() and raw APIC tag
-	if pic := m.Picture(); pic != nil && len(pic.Data) > 0 {
-		if img, _, err := image.Decode(bytes.NewReader(pic.Data)); err == nil {
-			bounds := img.Bounds()
-			metadata.Artwork = img
-			metadata.HasArtwork = true
-			metadata.ArtworkSize = bounds.Size()
-			metadata.ArtworkMIME = pic.MIMEType
+	// Handle attached artwork if available.
+	if pic := meta.Picture(); pic != nil && len(pic.Data) > 0 {
+		img, _, imgErr := image.Decode(bytes.NewReader(pic.Data))
+		if imgErr == nil {
+			m.Artwork = img
+			m.HasArtwork = true
+			m.ArtworkSize = img.Bounds().Size()
+			m.ArtworkMIME = pic.MIMEType
 		}
-	} else if raw := m.Raw(); raw != nil {
+	} else if raw := meta.Raw(); raw != nil {
 		if apicData, ok := raw["APIC"]; ok {
 			switch pic := apicData.(type) {
 			case *tag.Picture:
 				if pic != nil && len(pic.Data) > 0 {
-					if img, _, err := image.Decode(bytes.NewReader(pic.Data)); err == nil {
-						bounds := img.Bounds()
-						metadata.Artwork = img
-						metadata.HasArtwork = true
-						metadata.ArtworkSize = bounds.Size()
-						metadata.ArtworkMIME = pic.MIMEType
+					img, _, err := image.Decode(bytes.NewReader(pic.Data))
+					if err == nil {
+						m.Artwork = img
+						m.HasArtwork = true
+						m.ArtworkSize = img.Bounds().Size()
+						m.ArtworkMIME = pic.MIMEType
 					}
 				}
 			case []byte:
 				if len(pic) > 0 {
-					if img, _, err := image.Decode(bytes.NewReader(pic)); err == nil {
-						bounds := img.Bounds()
-						metadata.Artwork = img
-						metadata.HasArtwork = true
-						metadata.ArtworkSize = bounds.Size()
-						metadata.ArtworkMIME = "image/jpeg" // Assume JPEG as fallback
+					img, _, err := image.Decode(bytes.NewReader(pic))
+					if err == nil {
+						m.Artwork = img
+						m.HasArtwork = true
+						m.ArtworkSize = img.Bounds().Size()
+						m.ArtworkMIME = "image/jpeg"
 					}
 				}
 			}
 		}
 	}
-	return metadata, nil
+
+	// Second pass: decode the MP3 fully to get correct duration and sample rate.
+	// (If it's not an MP3, we fall back to minimal defaults.)
+	m.detectAudioProperties(data)
+
+	// Compute bitrate from the final duration.
+	if m.Duration > 0 {
+		m.BitRate = int(float64(m.FileSize*8) / m.Duration.Seconds() / 1000.0)
+	} else {
+		m.BitRate = 0
+	}
+
+	// Fill in defaults if some fields missing.
+	m.ensureDefaults()
+	return m, nil
 }
 
-func (m *Metadata) extractAdditionalMetadata(raw map[string]interface{}) {
-	// Lyrics
-	if lyrics := getStringTag(raw, "USLT"); lyrics != "" {
-		m.Lyrics = lyrics
+// decodeMP3Fully reads the MP3 data from start to finish, counting frames to get an accurate duration.
+func (m *Metadata) detectAudioProperties(raw []byte) {
+	r := bytes.NewReader(raw)
+	dec, err := mp3.NewDecoder(r)
+	if err != nil {
+		// If not MP3 or any error: leave defaults (e.g. WAV, FLAC can be handled in a future expansion).
+		return
 	}
+	m.SampleRate = dec.SampleRate()
+	m.Channels = 2
 
-	// Comments
-	if comment := getStringTag(raw, "COMM"); comment != "" {
-		m.Comment = comment
+	// Count total samples by reading all PCM data. Each frame is 4 bytes for 16-bit stereo (2 channels).
+	var totalPCMFrames int64
+	buf := make([]byte, 8192)
+	for {
+		n, readErr := dec.Read(buf)
+		if n > 0 {
+			// Each sample is 4 bytes for stereo 16-bit. So sampleCount = n / 4.
+			totalPCMFrames += int64(n / 4)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return
+		}
 	}
-
-	// Other ID3v2 tags
-	if bpm := getStringTag(raw, "TBPM"); bpm != "" {
-		m.BPM = bpm
-	}
-	if date := getStringTag(raw, "TDOR"); date != "" {
-		m.ReleaseDate = date
-	}
-	if copyright := getStringTag(raw, "TCOP"); copyright != "" {
-		m.Copyright = copyright
-	}
-	if encoded := getStringTag(raw, "TENC"); encoded != "" {
-		m.EncodedBy = encoded
-	}
-	if isrc := getStringTag(raw, "TSRC"); isrc != "" {
-		m.ISRC = isrc
-	}
+	sec := float64(totalPCMFrames) / float64(m.SampleRate)
+	m.Duration = time.Duration(sec * float64(time.Second))
 }
 
+// Provide fallbacks if missing.
 func (m *Metadata) ensureDefaults() {
 	if m.Title == "" {
 		m.Title = "Unknown Title"
@@ -176,26 +171,6 @@ func (m *Metadata) ensureDefaults() {
 	if m.Album == "" {
 		m.Album = "Unknown Album"
 	}
-}
-
-func getStringTag(raw map[string]interface{}, key string) string {
-	if val, ok := raw[key]; ok {
-		switch v := val.(type) {
-		case string:
-			return v
-		case []string:
-			if len(v) > 0 {
-				return v[0]
-			}
-		case []interface{}:
-			if len(v) > 0 {
-				if s, ok := v[0].(string); ok {
-					return s
-				}
-			}
-		}
-	}
-	return ""
 }
 
 // String formatting for metadata display
