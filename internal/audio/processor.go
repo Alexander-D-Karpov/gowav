@@ -185,7 +185,7 @@ func (p *Processor) SwitchVisualization(mode viz.ViewMode) (string, error) {
 		switch mode {
 		case viz.WaveformMode:
 			if len(p.audioModel.RawData) > 0 {
-				v = viz.NewWaveformViz(p.audioModel.RawData, p.audioModel.SampleRate)
+				v = viz.CreateWaveformViz(p.audioModel.RawData, p.audioModel.SampleRate)
 			}
 
 		case viz.SpectrogramMode:
@@ -215,6 +215,8 @@ func (p *Processor) SwitchVisualization(mode viz.ViewMode) (string, error) {
 					p.audioModel.SampleRate,
 				)
 			}
+		default:
+			p.setError(fmt.Sprintf("Unknown visualization mode: %d", mode))
 		}
 
 		if v == nil {
@@ -246,7 +248,7 @@ func (p *Processor) SwitchVisualization(mode viz.ViewMode) (string, error) {
 	return "", fmt.Errorf("preparing visualization")
 }
 
-func (p *Processor) GetVisualization(width, height int) string {
+func (p *Processor) GetVisualization() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -329,6 +331,8 @@ func (p *Processor) analyzeForMode(mode viz.ViewMode) error {
 			},
 			cancelChan,
 		)
+	default:
+		err = fmt.Errorf("unknown visualization mode: %d", mode)
 	}
 
 	if err != nil {

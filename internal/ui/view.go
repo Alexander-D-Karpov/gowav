@@ -104,10 +104,7 @@ func (m AudioModel) vizView() string {
 		sb.WriteString(fmt.Sprintf("\n%s - %s\n", track.Artist, track.Title))
 
 		// Render the visualization
-		vizContent := m.commander.GetProcessor().GetVisualization(
-			m.width,
-			m.height-6, // space for track info, input, etc.
-		)
+		vizContent := m.commander.GetProcessor().GetVisualization()
 		sb.WriteString(vizContent)
 
 		sb.WriteString("\n" + m.commander.GetPlaybackStatus())

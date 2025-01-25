@@ -18,6 +18,12 @@ const (
 	BeatMapMode
 )
 
+type ColorScheme struct {
+	Primary lipgloss.AdaptiveColor
+	Accent  lipgloss.AdaptiveColor
+	Text    lipgloss.AdaptiveColor
+}
+
 // ViewState maintains common visualization state
 type ViewState struct {
 	Mode          ViewMode
