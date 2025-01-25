@@ -47,14 +47,13 @@ func (p *Player) Play(data []byte) error {
 	}
 
 	if p.context == nil {
-		ctx, err := oto.NewContext(p.sampleRate, p.numChannels, 2, 8192)
+		ctx, err := oto.NewContext(p.sampleRate, p.numChannels, 2, 4096)
 		if err != nil {
 			return fmt.Errorf("failed to create audio context: %w", err)
 		}
 		p.context = ctx
 	}
 
-	// Handle pause/resume vs new playback
 	if p.state != StatePaused {
 		if p.player != nil {
 			p.player.Close()
@@ -129,14 +128,16 @@ func (p *Player) updatePosition() {
 	}
 }
 
-func (p *Player) GetDuration() time.Duration {
-	return p.duration
-}
-
 func (p *Player) SetDuration(d time.Duration) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	p.duration = d
+}
+
+func (p *Player) GetDuration() time.Duration {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	return p.duration
 }
 
 func (p *Player) RenderTrackBar(width int) string {
@@ -146,8 +147,8 @@ func (p *Player) RenderTrackBar(width int) string {
 	if p.state == StateStopped {
 		return ""
 	}
-	p.updatePosition()
 
+	p.updatePosition()
 	progress := float64(p.position) / float64(p.duration)
 	if progress > 1.0 {
 		progress = 1.0

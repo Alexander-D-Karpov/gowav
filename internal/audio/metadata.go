@@ -3,13 +3,21 @@ package audio
 import (
 	"bytes"
 	"fmt"
+	"github.com/hajimehoshi/go-mp3"
 	"image"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dhowden/tag"
-	"github.com/hajimehoshi/go-mp3"
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/encoding/korean"
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 type Metadata struct {
@@ -19,231 +27,386 @@ type Metadata struct {
 	Year        int
 	Genre       string
 	Track       string
-	TrackTotal  string
 	Disc        string
-	DiscTotal   string
 	AlbumArtist string
-	Composer    string
-	Conductor   string
-	Copyright   string
-	EncodedBy   string
-	Publisher   string
-	ISRC        string
-	Language    string
+
+	// Additional metadata fields
+	Encoder     string
 	Comment     string
-	Lyrics      string
-	BPM         string
+	Copyright   string
+	TSRC        string
+	EncodedBy   string
 	ReleaseDate string
 
-	Duration        time.Duration
-	BitRate         int
-	SampleRate      int
-	Channels        int
-	FileSize        int64
-	Format          string
-	Encoder         string
-	EncoderSettings string
+	// Audio properties
+	Duration   time.Duration
+	BitRate    int
+	SampleRate int
+	Channels   int
+	FileSize   int64
 
+	// Artwork
 	HasArtwork  bool
 	ArtworkMIME string
 	ArtworkSize image.Point
 	Artwork     image.Image
+	BPM         string
+	Lyrics      string
+
+	// Debug info
+	RawTags map[string]interface{}
 }
 
 func ExtractMetadata(data []byte) (*Metadata, error) {
-	// First pass: read tags.
 	reader := bytes.NewReader(data)
-	meta, err := tag.ReadFrom(reader)
+
+	// First try standard reading
+	m, err := tag.ReadFrom(reader)
 	if err != nil {
-		return nil, fmt.Errorf("failed reading tags: %w", err)
+		return nil, fmt.Errorf("failed to read metadata: %w", err)
 	}
 
-	// Collect basic tag info.
-	trackNum, trackTotal := meta.Track()
-	discNum, discTotal := meta.Disc()
-	m := &Metadata{
-		Title:       meta.Title(),
-		Artist:      meta.Artist(),
-		Album:       meta.Album(),
-		AlbumArtist: meta.AlbumArtist(),
-		Year:        meta.Year(),
-		Genre:       meta.Genre(),
-		Track:       fmt.Sprintf("%d", trackNum),
-		TrackTotal:  fmt.Sprintf("%d", trackTotal),
-		Disc:        fmt.Sprintf("%d", discNum),
-		DiscTotal:   fmt.Sprintf("%d", discTotal),
+	// Create metadata struct with basic info...
+	metadata := &Metadata{
+		Title:       tryDecode(m.Title()),
+		Artist:      tryDecode(m.Artist()),
+		Album:       tryDecode(m.Album()),
+		Year:        m.Year(),
+		Genre:       tryDecode(m.Genre()),
 		FileSize:    int64(len(data)),
-		Channels:    2, // By default. We'll confirm when decoding.
-		SampleRate:  44100,
+		AlbumArtist: tryDecode(m.AlbumArtist()),
 	}
 
-	// Handle attached artwork if available.
-	if pic := meta.Picture(); pic != nil && len(pic.Data) > 0 {
-		img, _, imgErr := image.Decode(bytes.NewReader(pic.Data))
-		if imgErr == nil {
-			m.Artwork = img
-			m.HasArtwork = true
-			m.ArtworkSize = img.Bounds().Size()
-			m.ArtworkMIME = pic.MIMEType
+	// Get audio properties
+	reader.Seek(0, io.SeekStart)
+	decoder, err := mp3.NewDecoder(reader)
+	if err == nil {
+		var totalSamples int64
+		buf := make([]byte, 8192)
+		for {
+			n, err := decoder.Read(buf)
+			if n > 0 {
+				totalSamples += int64(n / 4) // 4 bytes per stereo frame
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				break
+			}
 		}
-	} else if raw := meta.Raw(); raw != nil {
-		if apicData, ok := raw["APIC"]; ok {
+
+		sampleRate := decoder.SampleRate()
+		if totalSamples > 0 && sampleRate > 0 {
+			metadata.Duration = time.Duration(float64(totalSamples) / float64(sampleRate) * float64(time.Second))
+			metadata.SampleRate = sampleRate
+			metadata.Channels = 2
+			metadata.BitRate = int(float64(len(data)*8) / metadata.Duration.Seconds() / 1000)
+		}
+	}
+
+	// Get audio properties...
+	if rawTags := m.Raw(); rawTags != nil {
+		metadata.RawTags = rawTags
+
+		// Handle basic tags...
+		metadata.Track = getStringTag(rawTags, "TRCK")
+		metadata.Disc = getStringTag(rawTags, "TPOS")
+		metadata.EncodedBy = getStringTag(rawTags, "TENC")
+		metadata.Comment = getStringTag(rawTags, "COMM")
+		metadata.Copyright = getStringTag(rawTags, "TCOP")
+		metadata.TSRC = getStringTag(rawTags, "TSRC")
+		metadata.Encoder = getStringTag(rawTags, "TSSE")
+
+		// ARTWORK EXTRACTION WITH DETAILED LOGGING
+		logDebug("Starting artwork extraction...")
+		if apicData, ok := rawTags["APIC"]; ok {
+			logDebug("Found APIC tag, type: %T", apicData)
+
 			switch pic := apicData.(type) {
+			case tag.Picture:
+				logDebug("Processing tag.Picture: MIMEType=%s, Type=%d, Description=%s, DataLen=%d",
+					pic.MIMEType, pic.Type, pic.Description, len(pic.Data))
+				if len(pic.Data) > 0 {
+					if err := extractAndSetArtwork(metadata, pic.Data, pic.MIMEType); err != nil {
+						logDebug("Failed to extract artwork from tag.Picture: %v", err)
+					}
+				}
+
 			case *tag.Picture:
-				if pic != nil && len(pic.Data) > 0 {
-					img, _, err := image.Decode(bytes.NewReader(pic.Data))
-					if err == nil {
-						m.Artwork = img
-						m.HasArtwork = true
-						m.ArtworkSize = img.Bounds().Size()
-						m.ArtworkMIME = pic.MIMEType
+				if pic != nil {
+					logDebug("Processing *tag.Picture: MIMEType=%s, Type=%d, Description=%s, DataLen=%d",
+						pic.MIMEType, pic.Type, pic.Description, len(pic.Data))
+					if len(pic.Data) > 0 {
+						if err := extractAndSetArtwork(metadata, pic.Data, pic.MIMEType); err != nil {
+							logDebug("Failed to extract artwork from *tag.Picture: %v", err)
+						}
 					}
+				} else {
+					logDebug("*tag.Picture is nil")
 				}
+
 			case []byte:
+				logDebug("Processing raw []byte APIC data, length: %d", len(pic))
 				if len(pic) > 0 {
-					img, _, err := image.Decode(bytes.NewReader(pic))
-					if err == nil {
-						m.Artwork = img
-						m.HasArtwork = true
-						m.ArtworkSize = img.Bounds().Size()
-						m.ArtworkMIME = "image/jpeg"
+					if err := extractAndSetArtwork(metadata, pic, ""); err != nil {
+						logDebug("Failed to extract artwork from []byte: %v", err)
 					}
 				}
+
+			case map[string]interface{}:
+				logDebug("Processing map[string]interface{}: %v", pic)
+				if picData, ok := pic["Data"].([]byte); ok && len(picData) > 0 {
+					if err := extractAndSetArtwork(metadata, picData, ""); err != nil {
+						logDebug("Failed to extract artwork from map data: %v", err)
+					}
+				}
+
+			default:
+				logDebug("Unknown APIC type: %T, trying to convert to string for inspection: %v",
+					apicData, fmt.Sprintf("%v", apicData))
+
+				// Last resort: try to extract as raw bytes
+				if rawBytes, ok := getRawBytes(apicData); ok {
+					logDebug("Attempting extraction from raw bytes, length: %d", len(rawBytes))
+					if err := extractAndSetArtwork(metadata, rawBytes, ""); err != nil {
+						logDebug("Failed to extract artwork from raw bytes: %v", err)
+					}
+				}
+			}
+
+			if !metadata.HasArtwork {
+				logDebug("Failed to extract artwork after all attempts")
+			}
+		} else {
+			logDebug("No APIC tag found in metadata")
+		}
+	}
+
+	return metadata, nil
+}
+
+// Helper function to extract artwork
+func extractAndSetArtwork(metadata *Metadata, data []byte, mimeType string) error {
+	// Debug first few bytes to help identify format
+	logDebug("Image data starts with bytes: % x", data[:min(16, len(data))])
+
+	// Check for common image headers
+	if len(data) < 12 {
+		return fmt.Errorf("data too short for image")
+	}
+
+	// Try to identify format and strip any ID3v2/metadata prefix
+	var imgData []byte
+	switch {
+	case bytes.HasPrefix(data, []byte{0xff, 0xd8, 0xff}):
+		logDebug("Detected JPEG header")
+		imgData = data
+	case bytes.HasPrefix(data, []byte{0x89, 0x50, 0x4e, 0x47}):
+		logDebug("Detected PNG header")
+		imgData = data
+	default:
+		// Search for JPEG/PNG markers in case there's a prefix
+		jpegIndex := bytes.Index(data, []byte{0xff, 0xd8, 0xff})
+		pngIndex := bytes.Index(data, []byte{0x89, 0x50, 0x4e, 0x47})
+
+		if jpegIndex >= 0 {
+			logDebug("Found JPEG marker at offset %d", jpegIndex)
+			imgData = data[jpegIndex:]
+		} else if pngIndex >= 0 {
+			logDebug("Found PNG marker at offset %d", pngIndex)
+			imgData = data[pngIndex:]
+		} else {
+			// Try the whole data as-is
+			logDebug("No standard image markers found, trying raw data")
+			imgData = data
+		}
+	}
+
+	// Try decoding with explicit formats first
+	var img image.Image
+	var format string
+	var err error
+
+	// Try JPEG decoder first
+	if img, err = jpeg.Decode(bytes.NewReader(imgData)); err == nil {
+		format = "jpeg"
+		logDebug("Successfully decoded as JPEG")
+	} else {
+		logDebug("JPEG decode failed: %v", err)
+		// Reset reader and try PNG
+		if img, err = png.Decode(bytes.NewReader(imgData)); err == nil {
+			format = "png"
+			logDebug("Successfully decoded as PNG")
+		} else {
+			logDebug("PNG decode failed: %v", err)
+			// Last resort: try generic decoder
+			if img, format, err = image.Decode(bytes.NewReader(imgData)); err != nil {
+				return fmt.Errorf("failed to decode image (all attempts): %w", err)
 			}
 		}
 	}
 
-	// Second pass: decode the MP3 fully to get correct duration and sample rate.
-	// (If it's not an MP3, we fall back to minimal defaults.)
-	m.detectAudioProperties(data)
-
-	// Compute bitrate from the final duration.
-	if m.Duration > 0 {
-		m.BitRate = int(float64(m.FileSize*8) / m.Duration.Seconds() / 1000.0)
+	metadata.Artwork = img
+	metadata.HasArtwork = true
+	if mimeType != "" {
+		metadata.ArtworkMIME = mimeType
 	} else {
-		m.BitRate = 0
+		metadata.ArtworkMIME = "image/" + format
 	}
-
-	// Fill in defaults if some fields missing.
-	m.ensureDefaults()
-	return m, nil
+	bounds := img.Bounds()
+	metadata.ArtworkSize = bounds.Size()
+	logDebug("Successfully extracted artwork: format=%s size=%dx%d",
+		format, bounds.Dx(), bounds.Dy())
+	return nil
 }
 
-// decodeMP3Fully reads the MP3 data from start to finish, counting frames to get an accurate duration.
-func (m *Metadata) detectAudioProperties(raw []byte) {
-	r := bytes.NewReader(raw)
-	dec, err := mp3.NewDecoder(r)
-	if err != nil {
-		// If not MP3 or any error: leave defaults (e.g. WAV, FLAC can be handled in a future expansion).
-		return
+// Helper to try extracting raw bytes from unknown types
+func getRawBytes(data interface{}) ([]byte, bool) {
+	if str, ok := data.(string); ok {
+		return []byte(str), true
 	}
-	m.SampleRate = dec.SampleRate()
-	m.Channels = 2
-
-	// Count total samples by reading all PCM data. Each frame is 4 bytes for 16-bit stereo (2 channels).
-	var totalPCMFrames int64
-	buf := make([]byte, 8192)
-	for {
-		n, readErr := dec.Read(buf)
-		if n > 0 {
-			// Each sample is 4 bytes for stereo 16-bit. So sampleCount = n / 4.
-			totalPCMFrames += int64(n / 4)
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return
-		}
+	if byt, ok := data.([]byte); ok {
+		return byt, true
 	}
-	sec := float64(totalPCMFrames) / float64(m.SampleRate)
-	m.Duration = time.Duration(sec * float64(time.Second))
+	// Add more type conversions if needed
+	return nil, false
 }
 
-// Provide fallbacks if missing.
-func (m *Metadata) ensureDefaults() {
-	if m.Title == "" {
-		m.Title = "Unknown Title"
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	if m.Artist == "" {
-		m.Artist = "Unknown Artist"
-	}
-	if m.Album == "" {
-		m.Album = "Unknown Album"
-	}
+	return b
 }
 
-// String formatting for metadata display
 func (m *Metadata) String() string {
 	var b strings.Builder
 
-	// Make sure all rows have consistent width
 	const totalWidth = 80
+	const headerWidth = totalWidth - 2 // Accounting for borders
 
-	b.WriteString("┌" + strings.Repeat("─", totalWidth-2) + "┐\n")
+	// Write top border
+	b.WriteString("┌" + strings.Repeat("─", headerWidth) + "┐\n")
 
-	// Title line
+	// Title line with padding
 	title := "TRACK INFORMATION"
-	padding := (totalWidth - len(title) - 2) / 2
-	b.WriteString("│" + strings.Repeat(" ", padding) + title + strings.Repeat(" ", totalWidth-padding-len(title)-2) + "│\n")
+	padding := (headerWidth - len(title)) / 2
+	b.WriteString("│" + strings.Repeat(" ", padding) + title + strings.Repeat(" ", headerWidth-padding-len(title)) + "│\n")
 
-	b.WriteString("├" + strings.Repeat("─", totalWidth-2) + "┤\n")
+	// Separator
+	b.WriteString("├" + strings.Repeat("─", headerWidth) + "┤\n")
 
-	// Calculate fixed widths for columns
-	const labelWidth = 20
-	const valueWidth = totalWidth - labelWidth - 5 // 5 for "│ " and " │" borders
-
-	// Basic info
-	writeRow(&b, "Title", m.Title, labelWidth, valueWidth)
-	writeRow(&b, "Artist", m.Artist, labelWidth, valueWidth)
-	writeRow(&b, "Album", m.Album, labelWidth, valueWidth)
+	// Write info sections with consistent formatting
+	writeInfoSection(&b, "Title", m.Title, headerWidth)
+	writeInfoSection(&b, "Artist", m.Artist, headerWidth)
+	writeInfoSection(&b, "Album", m.Album, headerWidth)
 	if m.Track != "" {
-		track := m.Track
-		if m.TrackTotal != "" {
-			track += "/" + m.TrackTotal
-		}
-		writeRow(&b, "Track", track, labelWidth, valueWidth)
+		writeInfoSection(&b, "Track", m.Track, headerWidth)
 	}
 	if m.Disc != "" {
-		disc := m.Disc
-		if m.DiscTotal != "" {
-			disc += "/" + m.DiscTotal
-		}
-		writeRow(&b, "Disc", disc, labelWidth, valueWidth)
+		writeInfoSection(&b, "Disc", m.Disc, headerWidth)
 	}
-	writeRow(&b, "Year", fmt.Sprintf("%d", m.Year), labelWidth, valueWidth)
-	writeRow(&b, "Genre", m.Genre, labelWidth, valueWidth)
+	writeInfoSection(&b, "Year", fmt.Sprintf("%d", m.Year), headerWidth)
+	writeInfoSection(&b, "Genre", m.Genre, headerWidth)
 
-	// Tech details section
-	b.WriteString("├" + strings.Repeat("─", totalWidth-2) + "┤\n")
-	b.WriteString("│" + strings.Repeat(" ", padding) + "TECH DETAILS" + strings.Repeat(" ", totalWidth-padding-len("TECH DETAILS")-2) + "│\n")
-	b.WriteString("├" + strings.Repeat("─", totalWidth-2) + "┤\n")
+	// Additional metadata
+	if m.Comment != "" {
+		writeInfoSection(&b, "Comment", m.Comment, headerWidth)
+	}
+	if m.Copyright != "" {
+		writeInfoSection(&b, "Copyright", m.Copyright, headerWidth)
+	}
+	if m.TSRC != "" {
+		writeInfoSection(&b, "TSRC", m.TSRC, headerWidth)
+	}
+	if m.EncodedBy != "" {
+		writeInfoSection(&b, "Encoded By", m.EncodedBy, headerWidth)
+	}
 
-	writeRow(&b, "Duration", formatDuration(m.Duration), labelWidth, valueWidth)
-	writeRow(&b, "Bit Rate", fmt.Sprintf("%d kb/s", m.BitRate), labelWidth, valueWidth)
-	writeRow(&b, "Sample Rate", fmt.Sprintf("%d Hz", m.SampleRate), labelWidth, valueWidth)
-	writeRow(&b, "Channels", fmt.Sprintf("%d", m.Channels), labelWidth, valueWidth)
-	writeRow(&b, "File Size", formatFileSize(m.FileSize), labelWidth, valueWidth)
+	// Technical details section
+	b.WriteString("├" + strings.Repeat("─", headerWidth) + "┤\n")
+	b.WriteString("│" + strings.Repeat(" ", padding) + "TECH DETAILS" + strings.Repeat(" ", headerWidth-padding-len("TECH DETAILS")) + "│\n")
+	b.WriteString("├" + strings.Repeat("─", headerWidth) + "┤\n")
 
-	b.WriteString("└" + strings.Repeat("─", totalWidth-2) + "┘\n")
+	writeInfoSection(&b, "Duration", formatDuration(m.Duration), headerWidth)
+	writeInfoSection(&b, "Bit Rate", fmt.Sprintf("%d kb/s", m.BitRate), headerWidth)
+	writeInfoSection(&b, "Sample Rate", fmt.Sprintf("%d Hz", m.SampleRate), headerWidth)
+	writeInfoSection(&b, "Channels", fmt.Sprintf("%d", m.Channels), headerWidth)
+	writeInfoSection(&b, "File Size", formatFileSize(m.FileSize), headerWidth)
+
+	// Artwork section
+	if m.HasArtwork {
+		b.WriteString("├" + strings.Repeat("─", headerWidth) + "┤\n")
+		b.WriteString("│" + strings.Repeat(" ", padding) + "ARTWORK" + strings.Repeat(" ", headerWidth-padding-len("ARTWORK")) + "│\n")
+		b.WriteString("├" + strings.Repeat("─", headerWidth) + "┤\n")
+		writeInfoSection(&b, "MIME Type", m.ArtworkMIME, headerWidth)
+		writeInfoSection(&b, "Dimensions", fmt.Sprintf("%dx%d", m.ArtworkSize.X, m.ArtworkSize.Y), headerWidth)
+	}
+
+	// Raw tags debug section
+	if len(m.RawTags) > 0 {
+		b.WriteString("├" + strings.Repeat("─", headerWidth) + "┤\n")
+		b.WriteString("│" + strings.Repeat(" ", padding) + "RAW TAGS" + strings.Repeat(" ", headerWidth-padding-len("RAW TAGS")) + "│\n")
+		b.WriteString("├" + strings.Repeat("─", headerWidth) + "┤\n")
+
+		// Sort tags for consistent display
+		var keys []string
+		for k := range m.RawTags {
+			keys = append(keys, k)
+		}
+		for _, k := range keys {
+			v := m.RawTags[k]
+			writeInfoSection(&b, k, fmt.Sprintf("%v", v), headerWidth)
+		}
+	}
+
+	// Bottom border
+	b.WriteString("└" + strings.Repeat("─", headerWidth) + "┘\n")
+
 	return b.String()
 }
 
-func writeRow(b *strings.Builder, label, value string, labelWidth, valueWidth int) {
+// Keep existing helper functions
+func tryDecode(s string) string {
+	if s == "" {
+		return s
+	}
+	// Already valid UTF-8
+	if utf8.ValidString(s) {
+		return s
+	}
+
+	// Try common encodings
+	encodings := []encoding.Encoding{
+		charmap.ISO8859_1,
+		charmap.Windows1252,
+		japanese.EUCJP,
+		korean.EUCKR,
+		simplifiedchinese.GBK,
+	}
+
+	for _, enc := range encodings {
+		if decoded, err := enc.NewDecoder().String(s); err == nil {
+			return decoded
+		}
+	}
+	return s
+}
+
+func writeInfoSection(b *strings.Builder, label, value string, width int) {
 	if value == "" {
 		return
 	}
-	// Pad label
-	labelStr := fmt.Sprintf("%-*s", labelWidth, label)
+	const labelWidth = 15
+	valueWidth := width - labelWidth - 5 // 5 for "│ " and " │" borders and separator
 
-	// Truncate value if needed
+	// Truncate value if too long
 	if len(value) > valueWidth {
 		value = value[:valueWidth-3] + "..."
 	}
-	// Pad value
-	valueStr := fmt.Sprintf("%-*s", valueWidth, value)
 
-	b.WriteString(fmt.Sprintf("│ %s│ %s │\n", labelStr, valueStr))
+	b.WriteString(fmt.Sprintf("│ %-*s│ %-*s │\n", labelWidth, label, valueWidth, value))
 }
 
 func formatDuration(d time.Duration) string {

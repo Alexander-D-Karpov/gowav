@@ -155,13 +155,6 @@ func (m *Manager) SetMode(mode ViewMode) error {
 	return nil
 }
 
-func (m *Manager) SetDimensions(width, height int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.state.Width = width
-	m.state.Height = height
-}
-
 func (m *Manager) Render() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -243,4 +236,98 @@ func formatDuration(d time.Duration) string {
 	m := d / time.Minute
 	s := (d - m*time.Minute) / time.Second
 	return fmt.Sprintf("%02d:%02d", m, s)
+}
+func (m *Manager) CycleMode(direction int) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Get sorted list of available modes
+	var modes []ViewMode
+	for mode := range m.visualizations {
+		modes = append(modes, mode)
+	}
+	if len(modes) == 0 {
+		return "", fmt.Errorf("no visualizations available")
+	}
+
+	sort.Slice(modes, func(i, j int) bool { return modes[i] < modes[j] })
+
+	// Find current mode index
+	currentIdx := -1
+	for i, mode := range modes {
+		if mode == m.currentMode {
+			currentIdx = i
+			break
+		}
+	}
+
+	// Calculate next mode
+	nextIdx := 0
+	if currentIdx != -1 {
+		nextIdx = (currentIdx + direction + len(modes)) % len(modes)
+	}
+
+	// Set new mode
+	m.currentMode = modes[nextIdx]
+	return getModeName(m.currentMode), nil
+}
+
+func getModeName(mode ViewMode) string {
+	switch mode {
+	case WaveformMode:
+		return "Waveform"
+	case SpectrogramMode:
+		return "Spectrogram"
+	case DensityMode:
+		return "Density"
+	case TempoMode:
+		return "Tempo"
+	case BeatMapMode:
+		return "Beat Map"
+	default:
+		return "Unknown"
+	}
+}
+
+func (m *Manager) UpdateZoom(factor float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.state.Zoom *= factor
+	// Limit zoom range
+	if m.state.Zoom < 0.1 {
+		m.state.Zoom = 0.1
+	} else if m.state.Zoom > 10.0 {
+		m.state.Zoom = 10.0
+	}
+}
+
+func (m *Manager) UpdateOffset(delta time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.state.Offset += delta
+	// Ensure offset stays in valid range
+	if m.state.Offset < 0 {
+		m.state.Offset = 0
+	}
+	if m.state.TotalDuration > 0 && m.state.Offset > m.state.TotalDuration {
+		m.state.Offset = m.state.TotalDuration
+	}
+}
+
+func (m *Manager) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.state.Zoom = 1.0
+	m.state.Offset = 0
+}
+
+func (m *Manager) SetDimensions(width, height int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.state.Width = width
+	m.state.Height = height
 }
