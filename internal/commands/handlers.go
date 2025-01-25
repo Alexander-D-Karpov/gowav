@@ -4,6 +4,7 @@ import (
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	"gowav/internal/audio"
+	"gowav/internal/types"
 	"gowav/pkg/viz"
 	"path/filepath"
 	"strings"
@@ -89,9 +90,21 @@ func (c *Commander) handleVisualization(args []string) (string, error, tea.Cmd) 
 	if !ok {
 		return "", fmt.Errorf("unknown visualization: %s", vizType), nil
 	}
-	msg, err := c.processor.SwitchVisualization(vMode)
+
+	// Start analysis
+	output, err := c.processor.SwitchVisualization(vMode)
 	if err != nil {
+		if strings.Contains(err.Error(), "preparing visualization") {
+			// Return a special command to switch UI mode
+			return output, nil, func() tea.Msg {
+				return types.EnterVizMsg{Mode: vMode}
+			}
+		}
 		return "", err, nil
 	}
-	return msg, nil, nil
+
+	// If analysis was instant/cached, switch mode directly
+	return output, nil, func() tea.Msg {
+		return types.EnterVizMsg{Mode: vMode}
+	}
 }

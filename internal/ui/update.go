@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"gowav/internal/types"
 	"strings"
 	"time"
 
@@ -20,22 +21,20 @@ func (m AudioModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
-
-	//----------------------------------------------------------------------
-	// Example streaming progress updates
-	//----------------------------------------------------------------------
 	case streamMsg:
 		newModel, cmd := m.updateStreamProgress(msg)
 		return newModel, cmd
 
-	//----------------------------------------------------------------------
-	// Example manual progress messages
-	//----------------------------------------------------------------------
 	case progressMsg:
 		var cmd tea.Cmd
 		newProgress, cmd := m.progress.Update(float64(msg))
 		m.progress = newProgress.(progress.Model)
 		return m, cmd
+
+	case types.EnterVizMsg:
+		m.uiMode = ModeViz
+		m.currentVizMode = msg.Mode
+		return m, nil
 
 	//----------------------------------------------------------------------
 	// Bubble Tea key events
@@ -405,7 +404,6 @@ func (m *AudioModel) syncLoadingStateFromProcessor(st audio.ProcessingStatus) {
 	}
 }
 
-// updateStreamProgress is an example “streaming” progress mechanism, left for reference.
 func (m AudioModel) updateStreamProgress(msg streamMsg) (AudioModel, tea.Cmd) {
 	if msg.error != nil {
 		// Streaming error

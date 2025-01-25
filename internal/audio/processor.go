@@ -130,28 +130,29 @@ func (p *Processor) LoadFile(path string) error {
 
 func (p *Processor) SwitchVisualization(mode viz.ViewMode) (string, error) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	// If analysis is in progress, return status
 	if p.status.State == StateAnalyzing {
-		p.mu.Unlock()
 		return "", fmt.Errorf("analysis in progress: %s", p.status.Message)
 	}
 
 	// Check if track data is available
-	if p.audioModel == nil || len(p.audioModel.RawData) == 0 {
-		p.mu.Unlock()
+	if len(p.currentFile) == 0 {
 		return "", fmt.Errorf("no audio data available")
 	}
 
 	// Check if visualization already exists
 	if p.vizCache[mode] {
 		err := p.vizManager.SetMode(mode)
-		p.mu.Unlock()
 		if err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("Switched to %s visualization", getModeName(mode)), nil
 	}
+
+	startTime := time.Now()
+	logDebug("Starting analysis for visualization mode: %s", getModeName(mode))
 
 	// Start analysis for this visualization mode
 	p.status = ProcessingStatus{
@@ -161,8 +162,6 @@ func (p *Processor) SwitchVisualization(mode viz.ViewMode) (string, error) {
 		CanCancel: true,
 		StartTime: time.Now(),
 	}
-
-	p.mu.Unlock()
 
 	// Run analysis in background
 	go func() {
@@ -198,11 +197,6 @@ func (p *Processor) SwitchVisualization(mode viz.ViewMode) (string, error) {
 				)
 			}
 
-		case viz.DensityMode:
-			if len(p.audioModel.RawData) > 0 {
-				v = viz.NewDensityViz(p.audioModel.RawData, p.audioModel.SampleRate)
-			}
-
 		case viz.TempoMode:
 			if len(p.audioModel.BeatData) > 0 {
 				v = viz.NewTempoViz(
@@ -232,6 +226,10 @@ func (p *Processor) SwitchVisualization(mode viz.ViewMode) (string, error) {
 		v.SetTotalDuration(p.metadata.Duration)
 		p.vizManager.AddVisualization(mode, v)
 		p.vizCache[mode] = true
+
+		elapsedTime := time.Since(startTime)
+		logDebug("Completed %s visualization analysis in %v", getModeName(mode), elapsedTime)
+
 		err = p.vizManager.SetMode(mode)
 		if err != nil {
 			p.setError(fmt.Sprintf("Failed to set visualization mode: %v", err))
@@ -289,69 +287,62 @@ func (p *Processor) CancelProcessing() {
 
 func (p *Processor) analyzeForMode(mode viz.ViewMode) error {
 	p.mu.Lock()
-	if p.analyzedFor[mode] {
-		p.mu.Unlock()
-		return nil
-	}
-
-	if p.status.State != StateAnalyzing {
-		p.status = ProcessingStatus{
-			State:     StateAnalyzing,
-			Message:   fmt.Sprintf("Analyzing for %s visualization...", getModeName(mode)),
-			Progress:  0,
-			CanCancel: true,
-			StartTime: time.Now(),
-		}
-	}
+	startTime := time.Now()
 	cancelChan := p.analysisCancel
 	p.mu.Unlock()
+
+	logDebug("Starting analysis for mode: %s", getModeName(mode))
 
 	// Create model if needed
 	if p.audioModel == nil {
 		p.audioModel = NewModel(p.metadata.SampleRate)
+		logDebug("Created new audio model with sample rate: %d", p.metadata.SampleRate)
 	}
 
 	// Run analysis based on mode
 	var err error
 	switch mode {
 	case viz.WaveformMode:
+		logDebug("Starting waveform analysis")
 		err = p.audioModel.AnalyzeWaveform(
 			p.currentFile,
-			func(progress float64) { p.updateAnalysisProgress(progress) },
+			func(progress float64) {
+				p.updateAnalysisProgress(progress, "Analyzing waveform...")
+			},
 			cancelChan,
 		)
 
 	case viz.SpectrogramMode:
+		logDebug("Starting spectrogram analysis")
 		err = p.audioModel.AnalyzeSpectrum(
-			func(progress float64) { p.updateAnalysisProgress(progress) },
+			func(progress float64) {
+				p.updateAnalysisProgress(progress, "Computing frequency analysis...")
+			},
 			cancelChan,
 		)
 
 	case viz.TempoMode, viz.BeatMapMode:
+		logDebug("Starting tempo/beat analysis")
 		err = p.audioModel.AnalyzeBeats(
-			func(progress float64) { p.updateAnalysisProgress(progress) },
+			func(progress float64) {
+				p.updateAnalysisProgress(progress, "Detecting beats and tempo...")
+			},
 			cancelChan,
 		)
 	}
 
 	if err != nil {
-		p.setAnalysisComplete(err)
-		return err
+		logDebug("Analysis failed for %s: %v", getModeName(mode), err)
+		return fmt.Errorf("analysis failed: %v", err)
 	}
 
-	p.mu.Lock()
-	p.analyzedFor[mode] = true
-	p.status = ProcessingStatus{
-		State:    StateIdle,
-		Message:  "Analysis complete",
-		Progress: 1.0,
-	}
-	p.mu.Unlock()
+	elapsedTime := time.Since(startTime)
+	logDebug("Completed analysis for %s in %v", getModeName(mode), elapsedTime)
 
 	return nil
 }
 
-func (p *Processor) updateAnalysisProgress(progress float64) {
+func (p *Processor) updateAnalysisProgress(progress float64, message string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -375,7 +366,7 @@ func (p *Processor) updateAnalysisProgress(progress float64) {
 
 	p.status = ProcessingStatus{
 		State:     StateAnalyzing,
-		Message:   fmt.Sprintf("Analyzing... (ETA: %s)", etaMsg),
+		Message:   fmt.Sprintf("%s (ETA: %s)", message, etaMsg),
 		Progress:  progress,
 		CanCancel: true,
 		StartTime: p.status.StartTime,

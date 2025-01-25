@@ -17,6 +17,10 @@ import (
 // UIMode distinguishes different display modes in our TUI.
 type UIMode int
 
+type enterVizMsg struct {
+	mode viz.ViewMode
+}
+
 const (
 	// ModeFull is the default mode, showing main output + input + progress bar, etc.
 	ModeFull UIMode = iota
