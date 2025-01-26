@@ -87,8 +87,7 @@ func handleZoom(m *Manager, args []string) error {
 
 func handleColorScheme(m *Manager, args []string) error {
 	if len(args) == 0 {
-		m.cycleColorScheme()
-		return nil
+		return fmt.Errorf("color scheme selection not implemented")
 	}
 
 	// TODO: Add support for selecting specific color schemes by name

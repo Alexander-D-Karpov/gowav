@@ -1,4 +1,3 @@
-// internal/audio/model.go
 package audio
 
 import (
@@ -7,6 +6,8 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"gonum.org/v1/gonum/dsp/fourier"
 )
 
 type Model struct {
@@ -38,6 +39,7 @@ type Model struct {
 func NewModel(sampleRate int) *Model {
 	return &Model{
 		SampleRate: sampleRate,
+		// Default values: you can tweak
 		windowSize: 2048,
 		hopSize:    512,
 		fftSize:    2048,
@@ -69,7 +71,6 @@ func (m *Model) AnalyzeWaveform(rawBytes []byte, progressFn func(float64), cance
 	var wg sync.WaitGroup
 	errChan := make(chan error, numCPU)
 
-	// Process each chunk in parallel
 	for i := 0; i < numCPU; i++ {
 		wg.Add(1)
 		start := i * chunkSize * 2
@@ -107,7 +108,7 @@ func (m *Model) processWaveformChunk(rawBytes []byte, start, end int, progressFn
 			val := int16(rawBytes[i]) | int16(rawBytes[i+1])<<8
 			m.RawData[i/2] = float64(val) / 32768.0
 
-			// Report progress periodically
+			// Report progress every so often
 			if i%8192 == 0 {
 				progress := float64(i-start) / float64(end-start)
 				progressFn(progress)
@@ -128,28 +129,30 @@ func (m *Model) AnalyzeSpectrum(progressFn func(float64), cancelChan chan struct
 		return fmt.Errorf("insufficient data for spectrum analysis")
 	}
 
-	// Initialize frequency bands
 	m.initFrequencyBands()
 
-	// Initialize FFT data
+	// Prepare storage
 	m.FFTData = make([][]float64, numWindows)
 	for i := range m.FFTData {
 		m.FFTData[i] = make([]float64, m.fftSize/2)
 	}
 
-	// Process in parallel
+	// Create a real FFT plan with gonum
+	realFFT := fourier.NewFFT(m.fftSize)
+
+	// Process windows in parallel
 	numCPU := runtime.NumCPU()
 	windowChan := make(chan int, numWindows)
 	errChan := make(chan error, numCPU)
 	var wg sync.WaitGroup
 
-	// Start worker goroutines
+	// Worker goroutines
 	for i := 0; i < numCPU; i++ {
 		wg.Add(1)
-		go m.fftWorker(windowChan, &wg, progressFn, cancelChan, errChan)
+		go m.fftWorker(realFFT, windowChan, &wg, progressFn, cancelChan, errChan)
 	}
 
-	// Feed windows to workers
+	// Feed tasks
 	go func() {
 		for i := 0; i < numWindows; i++ {
 			select {
@@ -170,69 +173,68 @@ func (m *Model) AnalyzeSpectrum(progressFn func(float64), cancelChan chan struct
 	case err := <-errChan:
 		return fmt.Errorf("spectrum analysis error: %w", err)
 	default:
-		// Calculate additional spectral features
 		return m.calculateSpectralFeatures(cancelChan)
 	}
 }
 
 func (m *Model) initFrequencyBands() {
 	m.FreqBands = make([]float64, m.fftSize/2)
-	nyquist := float64(m.SampleRate) / 2
+	nyquist := float64(m.SampleRate) / 2.0
 	for i := range m.FreqBands {
 		m.FreqBands[i] = float64(i) * nyquist / float64(m.fftSize/2)
 	}
 }
 
-func (m *Model) fftWorker(windowChan chan int, wg *sync.WaitGroup, progressFn func(float64),
-	cancelChan chan struct{}, errChan chan error) {
+func (m *Model) fftWorker(
+	realFFT *fourier.FFT,
+	windowChan chan int,
+	wg *sync.WaitGroup,
+	progressFn func(float64),
+	cancelChan chan struct{},
+	errChan chan error,
+) {
 	defer wg.Done()
 
-	windowed := make([]float64, m.windowSize)
+	windowed := make([]float64, m.fftSize) // zero-padded if m.windowSize < m.fftSize
+
 	for windowIdx := range windowChan {
 		select {
 		case <-cancelChan:
 			errChan <- fmt.Errorf("cancelled")
 			return
 		default:
-			if err := m.processFFTWindow(windowIdx, windowed); err != nil {
-				errChan <- err
+			// Copy + apply window function (Hanning) into 'windowed'
+			startSample := windowIdx * m.hopSize
+			if startSample+m.windowSize > len(m.RawData) {
+				errChan <- fmt.Errorf("invalid window index")
 				return
 			}
 
+			for i := 0; i < m.fftSize; i++ {
+				if i < m.windowSize {
+					// Hanning window
+					w := 0.5 * (1 - math.Cos(2*math.Pi*float64(i)/float64(m.windowSize)))
+					windowed[i] = m.RawData[startSample+i] * w
+				} else {
+					windowed[i] = 0.0
+				}
+			}
+
+			// Perform real FFT => complex result
+			spectrum := realFFT.Coefficients(nil, windowed)
+
+			// Convert to magnitude
+			for freq := 0; freq < m.fftSize/2; freq++ {
+				re := real(spectrum[freq])
+				im := imag(spectrum[freq])
+				m.FFTData[windowIdx][freq] = math.Sqrt(re*re + im*im)
+			}
+
+			// Update progress occasionally
 			if windowIdx%(len(m.FFTData)/100+1) == 0 {
 				progressFn(float64(windowIdx) / float64(len(m.FFTData)))
 			}
 		}
-	}
-}
-
-func (m *Model) processFFTWindow(windowIdx int, windowed []float64) error {
-	startSample := windowIdx * m.hopSize
-	if startSample+m.windowSize > len(m.RawData) {
-		return fmt.Errorf("invalid window index")
-	}
-
-	// Apply Hanning window
-	for i := 0; i < m.windowSize; i++ {
-		win := 0.5 * (1 - math.Cos(2*math.Pi*float64(i)/float64(m.windowSize)))
-		windowed[i] = m.RawData[startSample+i] * win
-	}
-
-	// Compute FFT
-	m.computeFFT(windowIdx, windowed)
-
-	return nil
-}
-
-func (m *Model) computeFFT(windowIdx int, windowed []float64) {
-	for freq := 0; freq < m.fftSize/2; freq++ {
-		var re, im float64
-		for t := 0; t < m.windowSize; t++ {
-			angle := 2 * math.Pi * float64(freq*t) / float64(m.fftSize)
-			re += windowed[t] * math.Cos(angle)
-			im -= windowed[t] * math.Sin(angle)
-		}
-		m.FFTData[windowIdx][freq] = math.Sqrt(re*re + im*im)
 	}
 }
 
@@ -247,19 +249,18 @@ func (m *Model) calculateSpectralFeatures(cancelChan chan struct{}) error {
 		case <-cancelChan:
 			return fmt.Errorf("cancelled")
 		default:
-			// Calculate spectral flux
+			// Spectral flux
 			if i > 0 {
 				m.SpectralFlux[i] = m.calculateFlux(m.FFTData[i], m.FFTData[i-1])
 			}
 
-			// Find peak frequency
+			// Peak frequency
 			m.PeakFrequencies[i] = m.findPeakFrequency(m.FFTData[i])
 
-			// Calculate RMS energy
+			// RMS
 			m.RMSEnergy[i] = m.calculateRMSEnergy(m.FFTData[i])
 		}
 	}
-
 	return nil
 }
 
@@ -287,20 +288,21 @@ func (m *Model) findPeakFrequency(spectrum []float64) float64 {
 }
 
 func (m *Model) calculateRMSEnergy(spectrum []float64) float64 {
-	var sumSquares float64
+	var sumSq float64
 	for _, amp := range spectrum {
-		sumSquares += amp * amp
+		sumSq += amp * amp
 	}
-	return math.Sqrt(sumSquares / float64(len(spectrum)))
+	return math.Sqrt(sumSq / float64(len(spectrum)))
 }
 
 // AnalyzeBeats performs beat and tempo analysis
 func (m *Model) AnalyzeBeats(progressFn func(float64), cancelChan chan struct{}) error {
 	// Ensure we have spectrum data
 	if len(m.FFTData) == 0 {
-		if err := m.AnalyzeSpectrum(func(p float64) {
-			progressFn(p * 0.5) // First half for spectrum
-		}, cancelChan); err != nil {
+		err := m.AnalyzeSpectrum(func(p float64) {
+			progressFn(p * 0.5) // half for spectrum
+		}, cancelChan)
+		if err != nil {
 			return err
 		}
 	}
@@ -339,9 +341,8 @@ func (m *Model) calculateOnsetFunction(progressFn func(float64), cancelChan chan
 		go func(start, end int) {
 			defer wg.Done()
 
-			// Local history buffer
 			history := make([]float64, 43) // ~1 second
-			historyPos := 0
+			histPos := 0
 
 			for idx := start; idx < end; idx++ {
 				select {
@@ -349,9 +350,9 @@ func (m *Model) calculateOnsetFunction(progressFn func(float64), cancelChan chan
 					errChan <- fmt.Errorf("cancelled")
 					return
 				default:
-					// Calculate energy focusing on low frequencies
 					var energy float64
 					for freq := 0; freq < len(m.FFTData[idx]); freq++ {
+						// focusing on low frequencies
 						if freq < m.fftSize/4 {
 							energy += m.FFTData[idx][freq] * m.FFTData[idx][freq]
 						}
@@ -360,11 +361,9 @@ func (m *Model) calculateOnsetFunction(progressFn func(float64), cancelChan chan
 
 					m.BeatData[idx] = energy
 
-					// Update history and detect onsets
-					history[historyPos] = energy
-					historyPos = (historyPos + 1) % len(history)
+					history[histPos] = energy
+					histPos = (histPos + 1) % len(history)
 
-					// Calculate adaptive threshold
 					var sum, count float64
 					for _, e := range history {
 						if e > 0 {
@@ -373,21 +372,17 @@ func (m *Model) calculateOnsetFunction(progressFn func(float64), cancelChan chan
 						}
 					}
 					threshold := (sum / count) * 1.3
-
 					m.BeatOnsets[idx] = energy > threshold
-
-					// Update progress
-					if (idx-start)%(chunkSize/100+1) == 0 {
-						progress := 0.5 + 0.5*float64(idx-start)/float64(end-start)
-						progressFn(progress)
-					}
 				}
 			}
+
+			// progress callback
+			localProgress := float64(end-start) / float64(len(m.FFTData))
+			progressFn(0.5 + localProgress*0.5)
 		}(start, end)
 	}
 
 	wg.Wait()
-
 	select {
 	case err := <-errChan:
 		return err
@@ -397,88 +392,74 @@ func (m *Model) calculateOnsetFunction(progressFn func(float64), cancelChan chan
 }
 
 func (m *Model) detectBeats(progressFn func(float64), cancelChan chan struct{}) error {
-	// Collect inter-onset intervals
 	intervals := make([]float64, 0, len(m.BeatOnsets)/2)
 	lastBeat := -1
 
 	for i, isBeat := range m.BeatOnsets {
 		if isBeat {
 			if lastBeat != -1 {
-				interval := float64(i - lastBeat)
-				intervals = append(intervals, interval)
+				intervals = append(intervals, float64(i-lastBeat))
 			}
 			lastBeat = i
 		}
 	}
 
 	if len(intervals) == 0 {
-		m.EstimatedTempo = 120.0 // Default fallback
+		m.EstimatedTempo = 120.0
 		return nil
 	}
 
-	// Create histogram of intervals
 	hist := make(map[int]int)
 	for _, interval := range intervals {
 		bucket := int(math.Round(interval))
 		hist[bucket]++
 	}
 
-	// Find most common interval
 	maxCount := 0
 	bestInterval := 0
-	for interval, count := range hist {
+	for iv, count := range hist {
 		if count > maxCount {
 			maxCount = count
-			bestInterval = interval
+			bestInterval = iv
 		}
 	}
 
-	// Convert to BPM
 	if bestInterval > 0 {
 		secondsPerBeat := float64(bestInterval*m.hopSize) / float64(m.SampleRate)
-		m.EstimatedTempo = 60.0 / secondsPerBeat
-
-		// Refine beats using estimated tempo
+		if secondsPerBeat > 0 {
+			m.EstimatedTempo = 60.0 / secondsPerBeat
+		} else {
+			m.EstimatedTempo = 120.0
+		}
 		m.refineBeatDetection(progressFn, cancelChan)
 	} else {
-		m.EstimatedTempo = 120.0 // Default fallback
+		m.EstimatedTempo = 120.0
 	}
 
 	return nil
 }
 
-// refineBeatDetection improves beat detection using tempo information
 func (m *Model) refineBeatDetection(progressFn func(float64), cancelChan chan struct{}) {
-	// Calculate expected beat interval in frames
-	framesPerBeat := (60.0 / m.EstimatedTempo) * float64(m.SampleRate) / float64(m.hopSize)
+	framesPerBeat := (60.0 / m.EstimatedTempo) * (float64(m.SampleRate) / float64(m.hopSize))
+	searchWindow := int(framesPerBeat * 0.1)
+	refined := make([]bool, len(m.BeatOnsets))
 
-	// Window for searching around expected beat positions
-	searchWindow := int(framesPerBeat * 0.1) // 10% of beat interval
-
-	// Temporary storage for refined beats
-	refinedBeats := make([]bool, len(m.BeatOnsets))
-
-	// Start from first detected beat
 	var firstBeat int
 	for i, isBeat := range m.BeatOnsets {
 		if isBeat {
 			firstBeat = i
-			refinedBeats[i] = true
+			refined[i] = true
 			break
 		}
 	}
 
-	// Predict and refine subsequent beats
 	expectedPos := float64(firstBeat)
 	for expectedPos < float64(len(m.BeatOnsets)) {
 		select {
 		case <-cancelChan:
 			return
 		default:
-			// Convert expected position to integer
 			pos := int(math.Round(expectedPos))
-
-			// Define search window boundaries
 			start := pos - searchWindow
 			if start < 0 {
 				start = 0
@@ -488,7 +469,6 @@ func (m *Model) refineBeatDetection(progressFn func(float64), cancelChan chan st
 				end = len(m.BeatOnsets) - 1
 			}
 
-			// Find local maximum in beat detection function
 			maxEnergy := 0.0
 			maxPos := pos
 			for i := start; i <= end; i++ {
@@ -498,26 +478,20 @@ func (m *Model) refineBeatDetection(progressFn func(float64), cancelChan chan st
 				}
 			}
 
-			// Mark as beat if energy is significant
 			threshold := m.calculateLocalThreshold(maxPos)
 			if maxEnergy > threshold {
-				refinedBeats[maxPos] = true
+				refined[maxPos] = true
 			}
 
-			// Move to next expected beat position
 			expectedPos += framesPerBeat
 		}
 	}
 
-	// Update beat detections
-	m.BeatOnsets = refinedBeats
+	m.BeatOnsets = refined
 }
 
-// calculateLocalThreshold computes adaptive threshold for beat detection
 func (m *Model) calculateLocalThreshold(pos int) float64 {
-	// Window size for local energy calculation
-	windowSize := 43 // ~1 second
-
+	windowSize := 43
 	start := pos - windowSize/2
 	if start < 0 {
 		start = 0
@@ -527,7 +501,6 @@ func (m *Model) calculateLocalThreshold(pos int) float64 {
 		end = len(m.BeatData) - 1
 	}
 
-	// Calculate mean energy in window
 	var sum, count float64
 	for i := start; i <= end; i++ {
 		sum += m.BeatData[i]
@@ -535,7 +508,6 @@ func (m *Model) calculateLocalThreshold(pos int) float64 {
 	}
 	mean := sum / count
 
-	// Calculate standard deviation
 	var variance float64
 	for i := start; i <= end; i++ {
 		diff := m.BeatData[i] - mean
@@ -544,22 +516,19 @@ func (m *Model) calculateLocalThreshold(pos int) float64 {
 	variance /= count
 	stdDev := math.Sqrt(variance)
 
-	// Return threshold based on mean and standard deviation
 	return mean + 1.5*stdDev
 }
 
 // GetBeatTimes returns the timestamps of detected beats
 func (m *Model) GetBeatTimes() []time.Duration {
-	var beatTimes []time.Duration
-	frameDuration := time.Duration(float64(m.hopSize) / float64(m.SampleRate) * float64(time.Second))
-
+	var result []time.Duration
+	frameDur := time.Duration(float64(m.hopSize) / float64(m.SampleRate) * float64(time.Second))
 	for i, isBeat := range m.BeatOnsets {
 		if isBeat {
-			beatTime := time.Duration(i) * frameDuration
-			beatTimes = append(beatTimes, beatTime)
+			result = append(result, time.Duration(i)*frameDur)
 		}
 	}
-	return beatTimes
+	return result
 }
 
 // GetFrequencyResponse returns the frequency response at a specific time
@@ -582,7 +551,6 @@ func (m *Model) GetEnvelopeSegment(start, end time.Duration) []float64 {
 	if endFrame >= len(m.RMSEnergy) {
 		endFrame = len(m.RMSEnergy) - 1
 	}
-
 	return m.RMSEnergy[startFrame:endFrame]
 }
 
@@ -599,18 +567,16 @@ func (m *Model) GetSpectralCentroid(start, end time.Duration) []float64 {
 	}
 
 	centroids := make([]float64, endFrame-startFrame)
-
 	for i := range centroids {
-		var weightedSum, totalEnergy float64
+		var weightedSum, total float64
 		for j, freq := range m.FreqBands {
-			energy := m.FFTData[startFrame+i][j]
-			weightedSum += freq * energy
-			totalEnergy += energy
+			e := m.FFTData[startFrame+i][j]
+			weightedSum += freq * e
+			total += e
 		}
-		if totalEnergy > 0 {
-			centroids[i] = weightedSum / totalEnergy
+		if total > 0 {
+			centroids[i] = weightedSum / total
 		}
 	}
-
 	return centroids
 }

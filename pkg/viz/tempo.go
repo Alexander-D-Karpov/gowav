@@ -10,181 +10,163 @@ import (
 const tempoMaxHeight = 40
 
 type TempoViz struct {
-	tempoData     []float64
-	energyData    []float64
+	beatData      []float64
+	energy        []float64
 	sampleRate    int
-	maxTempo      float64
+	maxBeat       float64
 	maxEnergy     float64
-	style         lipgloss.Style
 	totalDuration time.Duration
 }
 
-func NewTempoViz(tempoData, energyData []float64, sampleRate int) *TempoViz {
-	maxTempo := 0.0
-	for _, t := range tempoData {
-		if t > maxTempo {
-			maxTempo = t
+func NewTempoViz(beatData, energy []float64, sampleRate int) *TempoViz {
+	maxBeat := 0.0
+	for _, b := range beatData {
+		if b > maxBeat {
+			maxBeat = b
 		}
 	}
+
 	maxEnergy := 0.0
-	for _, e := range energyData {
+	for _, e := range energy {
 		if e > maxEnergy {
 			maxEnergy = e
 		}
 	}
+
 	return &TempoViz{
-		tempoData:  tempoData,
-		energyData: energyData,
+		beatData:   beatData,
+		energy:     energy,
 		sampleRate: sampleRate,
-		maxTempo:   maxTempo,
+		maxBeat:    maxBeat,
 		maxEnergy:  maxEnergy,
-		style:      lipgloss.NewStyle(),
 	}
 }
 
-func (t *TempoViz) Name() string {
-	return "Tempo & Energy"
-}
-
-func (t *TempoViz) Description() string {
-	return "Displays tempo variations and energy levels over time"
-}
-
 func (t *TempoViz) Render(state ViewState) string {
-	if len(t.tempoData) == 0 {
-		return "No tempo data"
+	if len(t.beatData) == 0 {
+		return "No tempo data available"
 	}
 
 	var sb strings.Builder
 
+	// Calculate display dimensions
 	height := state.Height - 4
-	if height < 2 {
-		height = 2
-	}
 	if height > tempoMaxHeight {
 		height = tempoMaxHeight
 	}
-	half := height / 2
+	halfHeight := height / 2
 
-	sb.WriteString("Tempo (top half) vs Energy (bottom half)\n")
-
-	offset := int(state.Offset.Seconds() * float64(t.sampleRate) / 1024.0)
-	if offset < 0 {
-		offset = 0
-	}
-	if offset >= len(t.tempoData) {
-		offset = len(t.tempoData) - 1
-	}
-
-	width := state.Width
-	samplesPerCol := int(float64(len(t.tempoData)) / float64(width) / state.Zoom)
+	// Calculate samples per column and start position
+	samplesPerCol := int(float64(len(t.beatData)) / float64(state.Width) / state.Zoom)
 	if samplesPerCol < 1 {
 		samplesPerCol = 1
 	}
 
-	topBuf := make([][]string, half)
-	botBuf := make([][]string, half)
+	startSample := int((state.Offset.Seconds() / t.totalDuration.Seconds()) * float64(len(t.beatData)))
+	startSample = clamp(startSample, 0, len(t.beatData)-1)
 
-	for r := 0; r < half; r++ {
-		topBuf[r] = make([]string, width)
-		botBuf[r] = make([]string, width)
-		for c := 0; c < width; c++ {
-			topBuf[r][c] = " "
-			botBuf[r][c] = " "
+	// Initialize display buffers for tempo and energy
+	tempoBuf := make([][]string, halfHeight)
+	energyBuf := make([][]string, halfHeight)
+	for i := range tempoBuf {
+		tempoBuf[i] = make([]string, state.Width)
+		energyBuf[i] = make([]string, state.Width)
+		for j := range tempoBuf[i] {
+			tempoBuf[i][j] = " "
+			energyBuf[i][j] = " "
 		}
 	}
 
-	// Tempo
-	for col := 0; col < width; col++ {
-		idx := offset + col*samplesPerCol
-		if idx >= len(t.tempoData) {
+	// Fill buffers
+	for x := 0; x < state.Width; x++ {
+		idx := startSample + (x * samplesPerCol)
+		if idx >= len(t.beatData) {
 			break
 		}
-		sum := 0.0
+
+		// Average values for this column
+		var beatSum, energySum float64
 		count := 0
-		for i := idx; i < idx+samplesPerCol && i < len(t.tempoData); i++ {
-			sum += t.tempoData[i]
+
+		for i := 0; i < samplesPerCol && (idx+i) < len(t.beatData); i++ {
+			beatSum += t.beatData[idx+i]
+			energySum += t.energy[idx+i]
 			count++
 		}
-		tempo := sum / float64(count)
 
-		scaled := int((tempo / t.maxTempo) * float64(half-1))
-		for row := half - 1; row >= 0; row-- {
-			if row > half-1-scaled {
-				continue
+		if count > 0 {
+			beatVal := beatSum / float64(count)
+			energyVal := energySum / float64(count)
+
+			// Map to display heights
+			beatHeight := int((beatVal / t.maxBeat) * float64(halfHeight-1))
+			energyHeight := int((energyVal / t.maxEnergy) * float64(halfHeight-1))
+
+			// Fill tempo buffer
+			for y := halfHeight - 1; y >= halfHeight-beatHeight-1; y-- {
+				if y >= 0 {
+					tempoBuf[y][x] = lipgloss.NewStyle().
+						Foreground(state.ColorScheme.Primary).
+						Render("█")
+				}
 			}
-			color := getGradientColor(float64(row)/float64(half-1), state.ColorScheme)
-			topBuf[row][col] = lipgloss.NewStyle().Foreground(color).Render("█")
-		}
-	}
 
-	// Energy
-	for col := 0; col < width; col++ {
-		idx := offset + col*samplesPerCol
-		if idx >= len(t.energyData) {
-			break
-		}
-		sum := 0.0
-		count := 0
-		for i := idx; i < idx+samplesPerCol && i < len(t.energyData); i++ {
-			sum += t.energyData[i]
-			count++
-		}
-		energy := sum / float64(count)
-
-		scaled := int((energy / t.maxEnergy) * float64(half-1))
-		for row := half - 1; row >= 0; row-- {
-			if row > half-1-scaled {
-				continue
+			// Fill energy buffer
+			for y := halfHeight - 1; y >= halfHeight-energyHeight-1; y-- {
+				if y >= 0 {
+					energyBuf[y][x] = lipgloss.NewStyle().
+						Foreground(state.ColorScheme.Secondary).
+						Render("█")
+				}
 			}
-			intensity := float64(row) / float64(half-1)
-			color := getSpectrogramColor(intensity, state.ColorScheme)
-			botBuf[row][col] = lipgloss.NewStyle().Foreground(color).Render("█")
 		}
 	}
 
-	// Render top half
-	for r := 0; r < half; r++ {
-		sb.WriteString(strings.Join(topBuf[r], ""))
-		sb.WriteString("\n")
-	}
-	// Render bottom half
-	for r := 0; r < half; r++ {
-		sb.WriteString(strings.Join(botBuf[r], ""))
+	// Render buffers
+	sb.WriteString("Tempo:\n")
+	for y := 0; y < halfHeight; y++ {
+		sb.WriteString(strings.Join(tempoBuf[y], ""))
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString(t.renderTimeAxis(state, offset, samplesPerCol))
+	sb.WriteString("Energy:\n")
+	for y := 0; y < halfHeight; y++ {
+		sb.WriteString(strings.Join(energyBuf[y], ""))
+		sb.WriteString("\n")
+	}
+
+	// Render time axis
+	sb.WriteString(t.renderTimeAxis(state, startSample, samplesPerCol))
 	return sb.String()
 }
 
-func (t *TempoViz) renderTimeAxis(state ViewState, offset, samplesPerCol int) string {
+func (t *TempoViz) renderTimeAxis(state ViewState, startSample, samplesPerCol int) string {
 	var sb strings.Builder
-	totalSteps := len(t.tempoData)
-	secondsPerStep := 1024.0 / float64(t.sampleRate)
 
-	markers := 10
-	stepCol := state.Width / markers
-	if stepCol < 1 {
-		stepCol = 1
+	secPerSample := 1.0 / float64(t.sampleRate)
+	numMarkers := state.Width / 10
+
+	for i := 0; i <= numMarkers; i++ {
+		pos := float64(i) * float64(state.Width) / float64(numMarkers)
+		timeOffset := time.Duration(float64(startSample+int(pos)*samplesPerCol) * secPerSample * float64(time.Second))
+		sb.WriteString(fmt.Sprintf("%-8s", formatDuration(timeOffset)))
 	}
-	for c := 0; c < state.Width; c += stepCol {
-		idx := offset + c*samplesPerCol
-		if idx >= totalSteps {
-			break
-		}
-		tSec := float64(idx) * secondsPerStep
-		tstamp := time.Duration(tSec * float64(time.Second))
-		timeStr := fmt.Sprintf("%02d:%02d", int(tstamp.Minutes()), int(tstamp.Seconds())%60)
-		sb.WriteString(fmt.Sprintf("%-7s", timeStr))
-	}
+
 	return sb.String()
 }
 
-func (t *TempoViz) HandleInput(key string, state *ViewState) bool {
-	return false
+func (t *TempoViz) Name() string {
+	return "Tempo Analysis"
+}
+
+func (t *TempoViz) Description() string {
+	return "Tempo and energy patterns"
 }
 
 func (t *TempoViz) SetTotalDuration(duration time.Duration) {
 	t.totalDuration = duration
+}
+
+func (t *TempoViz) HandleInput(string, *ViewState) bool {
+	return false
 }

@@ -78,6 +78,12 @@ func (c *Commander) handleVisualization(args []string) (string, error, tea.Cmd) 
 	if len(args) == 0 {
 		return "", fmt.Errorf("visualization type required"), nil
 	}
+
+	// Check if processor is initialized
+	if c.processor == nil || !c.IsInTrackMode() {
+		return "", fmt.Errorf("no track loaded"), nil
+	}
+
 	vizMap := map[string]viz.ViewMode{
 		"wave":     viz.WaveformMode,
 		"spectrum": viz.SpectrogramMode,
@@ -85,25 +91,28 @@ func (c *Commander) handleVisualization(args []string) (string, error, tea.Cmd) 
 		"density":  viz.DensityMode,
 		"beat":     viz.BeatMapMode,
 	}
+
 	vizType := strings.ToLower(args[0])
 	vMode, ok := vizMap[vizType]
 	if !ok {
 		return "", fmt.Errorf("unknown visualization: %s", vizType), nil
 	}
 
-	// Start analysis
+	// Always try to switch visualization, which will initiate analysis if needed
 	output, err := c.processor.SwitchVisualization(vMode)
 	if err != nil {
+		// Check if it's just "preparing visualization" message
 		if strings.Contains(err.Error(), "preparing visualization") {
-			// Return a special command to switch UI mode
 			return output, nil, func() tea.Msg {
 				return types.EnterVizMsg{Mode: vMode}
 			}
 		}
-		return "", err, nil
+
+		// Otherwise it's a real error
+		return "", fmt.Errorf("failed to switch visualization: %w", err), nil
 	}
 
-	// If analysis was instant/cached, switch mode directly
+	// If we got here, either visualization was cached or instant
 	return output, nil, func() tea.Msg {
 		return types.EnterVizMsg{Mode: vMode}
 	}
