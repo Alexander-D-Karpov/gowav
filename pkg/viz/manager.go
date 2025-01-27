@@ -32,23 +32,6 @@ func NewManager() *Manager {
 	}
 }
 
-func (m *Manager) AddVisualization(mode ViewMode, viz Visualization) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.visualizations[mode] = viz
-}
-
-func (m *Manager) SetMode(mode ViewMode) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, exists := m.visualizations[mode]; !exists {
-		return fmt.Errorf("visualization mode not available: %v", mode)
-	}
-	m.currentMode = mode
-	return nil
-}
-
 func (m *Manager) CycleMode(direction int) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -130,12 +113,20 @@ func (m *Manager) UpdateOffset(delta time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.state.Offset += delta
-	if m.state.Offset < 0 {
-		m.state.Offset = 0
+	// Calculate new offset
+	newOffset := m.state.Offset + delta
+
+	// Apply bounds
+	if newOffset < 0 {
+		newOffset = 0
 	}
-	if m.state.TotalDuration > 0 && m.state.Offset > m.state.TotalDuration {
-		m.state.Offset = m.state.TotalDuration
+	if m.state.TotalDuration > 0 && newOffset > m.state.TotalDuration {
+		newOffset = m.state.TotalDuration
+	}
+
+	// Update state
+	if newOffset != m.state.Offset {
+		m.state.Offset = newOffset
 	}
 }
 
@@ -153,4 +144,40 @@ func (m *Manager) SetDimensions(width, height int) {
 
 	m.state.Width = width
 	m.state.Height = height
+}
+
+func (m *Manager) AddVisualization(mode ViewMode, viz Visualization) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Set total duration if available
+	if m.state.TotalDuration > 0 {
+		viz.SetTotalDuration(m.state.TotalDuration)
+	}
+
+	m.visualizations[mode] = viz
+
+	// If this is our first visualization, set it as current
+	if len(m.visualizations) == 1 {
+		m.currentMode = mode
+	}
+}
+
+func (m *Manager) SetMode(mode ViewMode) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// First, ensure visualization exists or can be created
+	viz, exists := m.visualizations[mode]
+	if !exists {
+		return fmt.Errorf("visualization mode not available: %v", mode)
+	}
+
+	// Set the mode and update dimensions if needed
+	m.currentMode = mode
+	if m.state.Width > 0 && m.state.Height > 0 {
+		viz.SetTotalDuration(m.state.TotalDuration)
+	}
+
+	return nil
 }
