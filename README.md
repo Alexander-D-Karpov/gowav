@@ -1,23 +1,64 @@
 # GoWav Music Player
 
-GoWav is a terminal-based music player written in Go, featuring a modern TUI powered by Bubble Tea
+GoWav is a terminal-based music player written in Go, featuring a modern TUI (Terminal User Interface) powered by Bubble Tea
 
 ## Features
 
 - Multiple audio format support (MP3, FLAC, WAV, OGG)
+- Interactive visualizations:
+    - Waveform display
+    - Spectrogram
+    - Beat/rhythm patterns
+    - Tempo analysis
+    - Audio density mapping
 - Album artwork display in terminal (ASCII art)
-- Interactive terminal UI
-- Music metadata display and management
-- Configurable UI modes (full and mini)
+- Detailed metadata display and management
+- Multiple UI modes (full and mini)
 
-## Installation
+## Keyboard Controls
+
+### General Controls
+- `Ctrl+Q` - Quit
+- `Ctrl+M` - Toggle UI mode
+- `Ctrl+L` - Clear screen
+- `?` - Show keyboard shortcuts
+
+### Playback Controls
+- `Ctrl+P` - Play
+- `Ctrl+Space` - Pause
+- `Ctrl+S` - Stop
+- `Ctrl+U/D` - Volume up/down
+
+### Visualization Controls
+- `v` - Enter visualization mode
+- `Tab` - Next visualization
+- `Shift+Tab` - Previous visualization
+- `+/-` - Zoom in/out
+- `←/→` - Scroll through track
+- `0` - Reset view
+- `Esc` - Exit visualization mode
+
+## Basic Commands
+```
+help, h          Show help
+load, l <path>   Load audio file
+search, s        Search for music
+viz              Enter visualization mode
+quit, q          Exit application
+```
+
+### Visualization Types
+- `viz wave` - Waveform visualization
+- `viz spectrum` - Spectrogram display
+- `viz tempo` - Tempo/energy analysis
+- `viz density` - Audio density map
+- `viz beat` - Beat and rhythm patterns
+
+## Building from Source
 
 ### Prerequisites
-
 - Go 1.23.2 or higher
 - Audio dependencies (platform specific)
-
-### Building from Source
 
 ```bash
 git clone https://github.com/Alexander-D-Karpov/gowav.git
@@ -26,23 +67,8 @@ go mod download
 go build
 ```
 
-## Usage
-
-### Basic Commands
-
-- `help`, `h` - Show available commands
-- `load`, `l <path>` - Load an audio file
-- `search`, `s <query>` - Search for music
-- `quit`, `q` - Exit the application
-
-### Keyboard Shortcuts
-
-- `Ctrl+Q` - Quit
-- `Ctrl+P` - Play
-- `Ctrl+Space` - Pause
-- `Ctrl+S` - Stop
-- `Ctrl+M` - Toggle UI mode
-- `?` - Show all shortcuts
+## License
+MIT License - see LICENSE file for details
 
 ## Dependencies
 
@@ -55,10 +81,7 @@ go build
 - loading folder with music
 - music conversion
 - music editing
-- music visualization
 - music streaming
 - loading from online sources
-- building graph of music (volume, power, etc)
 - better UI (more interactive, more information, more customization)
 - better audio support (more formats, more options)
-- better metadata support (more formats, more options)

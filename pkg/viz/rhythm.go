@@ -20,6 +20,9 @@ type BeatViz struct {
 }
 
 func NewBeatViz(beatData []float64, onsets []bool, bpm float64, sampleRate int) *BeatViz {
+	if len(beatData) == 0 {
+		return &BeatViz{}
+	}
 	// Find max beat strength
 	maxStrength := 0.0
 	for _, b := range beatData {
@@ -29,8 +32,10 @@ func NewBeatViz(beatData []float64, onsets []bool, bpm float64, sampleRate int) 
 	}
 
 	beatStrength := make([]float64, len(beatData))
-	for i, b := range beatData {
-		beatStrength[i] = b / maxStrength
+	if maxStrength > 0 {
+		for i, b := range beatData {
+			beatStrength[i] = b / maxStrength
+		}
 	}
 
 	return &BeatViz{
@@ -44,7 +49,7 @@ func NewBeatViz(beatData []float64, onsets []bool, bpm float64, sampleRate int) 
 }
 
 func (b *BeatViz) Render(state ViewState) string {
-	if len(b.beatData) == 0 {
+	if len(b.beatData) == 0 || b.sampleRate <= 0 {
 		return "No beat data available"
 	}
 
@@ -55,6 +60,9 @@ func (b *BeatViz) Render(state ViewState) string {
 
 	// Calculate dimensions
 	height := state.Height - 5
+	if height < 2 {
+		height = 2
+	}
 	if height > beatMaxHeight {
 		height = beatMaxHeight
 	}
@@ -65,119 +73,130 @@ func (b *BeatViz) Render(state ViewState) string {
 		samplesPerCol = 1
 	}
 
-	startSample := int((state.Offset.Seconds() / b.totalDuration.Seconds()) * float64(len(b.beatData)))
-	startSample = clamp(startSample, 0, len(b.beatData)-1)
-
-	// Initialize display buffer
-	display := make([][]string, height)
-	for i := range display {
-		display[i] = make([]string, state.Width)
-		for j := range display[i] {
-			display[i][j] = " "
+	// Convert offset time → sample
+	if b.totalDuration > 0 {
+		startSample := int((state.Offset.Seconds() / b.totalDuration.Seconds()) * float64(len(b.beatData)))
+		if startSample < 0 {
+			startSample = 0
 		}
-	}
-
-	// Fill display buffer
-	for x := 0; x < state.Width; x++ {
-		idx := startSample + (x * samplesPerCol)
-		if idx >= len(b.beatData) {
-			break
+		if startSample >= len(b.beatData) {
+			startSample = len(b.beatData) - 1
 		}
 
-		// Average beat strength and check for onsets
-		var strengthSum float64
-		hasOnset := false
-		count := 0
-
-		end := idx + samplesPerCol
-		if end > len(b.beatData) {
-			end = len(b.beatData)
-		}
-
-		for i := idx; i < end; i++ {
-			strengthSum += b.beatStrength[i]
-			if i < len(b.onsets) && b.onsets[i] {
-				hasOnset = true
+		// Prepare the display
+		display := make([][]string, height)
+		for i := range display {
+			display[i] = make([]string, state.Width)
+			for j := range display[i] {
+				display[i][j] = " "
 			}
-			count++
 		}
 
-		if count > 0 {
-			avgStrength := strengthSum / float64(count)
-			barHeight := int(avgStrength * float64(height-1))
+		// Fill display buffer
+		for x := 0; x < state.Width; x++ {
+			idx := startSample + (x * samplesPerCol)
+			if idx >= len(b.beatData) {
+				break
+			}
 
-			// Draw beat strength bars
-			for y := height - 1; y >= height-barHeight-1; y-- {
-				if y >= 0 {
-					style := lipgloss.NewStyle()
-					if hasOnset {
-						style = style.Foreground(state.ColorScheme.Primary)
-					} else {
-						style = style.Foreground(state.ColorScheme.Secondary)
+			// Average beat strength and check for onsets
+			var strengthSum float64
+			hasOnset := false
+			count := 0
+
+			end := idx + samplesPerCol
+			if end > len(b.beatData) {
+				end = len(b.beatData)
+			}
+
+			for i := idx; i < end; i++ {
+				strengthSum += b.beatStrength[i]
+				if i < len(b.onsets) && b.onsets[i] {
+					hasOnset = true
+				}
+				count++
+			}
+
+			if count > 0 {
+				avgStrength := strengthSum / float64(count)
+				barHeight := int(avgStrength * float64(height-1))
+
+				// Draw beat strength bars
+				for y := height - 1; y >= height-barHeight-1; y-- {
+					if y >= 0 {
+						style := lipgloss.NewStyle()
+						if hasOnset {
+							style = style.Foreground(state.ColorScheme.Primary)
+						} else {
+							style = style.Foreground(state.ColorScheme.Secondary)
+						}
+						display[y][x] = style.Render("█")
 					}
-					display[y][x] = style.Render("█")
+				}
+
+				// Mark beat onsets at the top
+				if hasOnset {
+					display[0][x] = lipgloss.NewStyle().
+						Foreground(state.ColorScheme.Primary).
+						Render("▼")
 				}
 			}
-
-			// Mark beat onsets at the top
-			if hasOnset {
-				display[0][x] = lipgloss.NewStyle().
-					Foreground(state.ColorScheme.Primary).
-					Render("▼")
-			}
 		}
+
+		// Render display buffer
+		for y := 0; y < height; y++ {
+			sb.WriteString(strings.Join(display[y], ""))
+			sb.WriteString("\n")
+		}
+
+		// Draw time axis
+		sb.WriteString(b.renderTimeAxis(state, startSample, samplesPerCol))
+		sb.WriteString("\nBeats: ")
+		sb.WriteString(lipgloss.NewStyle().
+			Foreground(state.ColorScheme.Primary).
+			Render("▼ "))
+		sb.WriteString("Onset  ")
+		sb.WriteString(lipgloss.NewStyle().
+			Foreground(state.ColorScheme.Secondary).
+			Render("█ "))
+		sb.WriteString("Energy")
+	} else {
+		// If we have zero totalDuration, just say we have data but can’t place it
+		sb.WriteString("(No track duration set, cannot place timeline)\n")
 	}
-
-	// Render display buffer
-	for y := 0; y < height; y++ {
-		sb.WriteString(strings.Join(display[y], ""))
-		sb.WriteString("\n")
-	}
-
-	// Draw time axis
-	sb.WriteString(b.renderTimeAxis(state, startSample, samplesPerCol))
-
-	// Add legend
-	sb.WriteString("\nBeats: ")
-	sb.WriteString(lipgloss.NewStyle().
-		Foreground(state.ColorScheme.Primary).
-		Render("▼ "))
-	sb.WriteString("Strong onset  ")
-	sb.WriteString(lipgloss.NewStyle().
-		Foreground(state.ColorScheme.Secondary).
-		Render("█ "))
-	sb.WriteString("Energy level")
-
 	return sb.String()
 }
 
 func (b *BeatViz) renderTimeAxis(state ViewState, startSample, samplesPerCol int) string {
 	var sb strings.Builder
 
-	// Calculate time markers
 	secPerSample := 1.0 / float64(b.sampleRate)
 	numMarkers := state.Width / 10
 	if numMarkers < 1 {
 		numMarkers = 1
 	}
 
-	// Draw time markers
 	for i := 0; i <= numMarkers; i++ {
 		pos := float64(i) * float64(state.Width) / float64(numMarkers)
 		samplePos := startSample + int(pos)*samplesPerCol
+		if samplePos < 0 {
+			samplePos = 0
+		}
+		if samplePos >= len(b.beatData) {
+			samplePos = len(b.beatData) - 1
+		}
 		timeOffset := time.Duration(float64(samplePos) * secPerSample * float64(time.Second))
 
 		if i == 0 {
 			sb.WriteString(formatDuration(timeOffset))
 		} else {
-			padding := int(pos) - sb.Len()
+			padding := int(pos) - len(sb.String())
 			if padding > 0 {
 				sb.WriteString(strings.Repeat(" ", padding))
 				sb.WriteString(formatDuration(timeOffset))
 			}
 		}
 	}
-
 	return sb.String()
 }
 

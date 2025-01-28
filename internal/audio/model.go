@@ -1,16 +1,19 @@
 package audio
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"math"
 	"runtime"
 	"sync"
 	"time"
 
+	"github.com/hajimehoshi/go-mp3"
 	"gonum.org/v1/gonum/dsp/fourier"
-	"gonum.org/v1/gonum/floats"
 )
 
+// Model represents the raw PCM data plus FFT outputs and beat/onset analysis results.
 type Model struct {
 	RawData    []float64
 	SampleRate int
@@ -31,152 +34,191 @@ type Model struct {
 	fftSize    int
 }
 
+// NewModel creates a new Model with default analysis parameters.
 func NewModel(sampleRate int) *Model {
 	return &Model{
 		SampleRate: sampleRate,
-		// Default values
 		windowSize: 2048,
 		hopSize:    512,
 		fftSize:    2048,
 	}
 }
 
+// SetParameters updates the FFT window/hop sizes, if needed.
 func (m *Model) SetParameters(windowSize, hopSize, fftSize int) {
 	m.windowSize = windowSize
 	m.hopSize = hopSize
 	m.fftSize = fftSize
 }
 
-// AnalyzeWaveform converts raw bytes to float64 samples and performs basic analysis
-func (m *Model) AnalyzeWaveform(rawBytes []byte, progressFn func(float64), cancelChan chan struct{}) error {
-	startTotal := time.Now()
+// decodeMP3ToPCM converts MP3 bytes to a mono float64 slice.
+func decodeMP3ToPCM(
+	mp3Bytes []byte,
+	progressFn func(float64),
+	cancelChan chan struct{},
+) ([]float64, int, error) {
 
-	dataLen := len(rawBytes)
-	if dataLen < 2 {
-		return fmt.Errorf("data too short")
+	reader := bytes.NewReader(mp3Bytes)
+	dec, err := mp3.NewDecoder(reader)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to init mp3 decoder: %w", err)
 	}
 
-	numCPU := runtime.NumCPU()
-	chunkSize := dataLen / (2 * numCPU)
-	if chunkSize < 1024 {
-		chunkSize = 1024
-	}
+	sampleRate := dec.SampleRate() // often 44100 or 48000
+	const bytesPerSample = 2
+	const channels = 2
+	frameSize := bytesPerSample * channels
 
-	m.RawData = make([]float64, dataLen/2)
+	var pcm []float64
+	totalSize := int64(len(mp3Bytes))
+	var totalRead int64
 
-	var wg sync.WaitGroup
-	errChan := make(chan error, numCPU)
-
-	// We'll process in chunkSize blocks of *samples* (so chunkSize is for floats)
-	chunks := (dataLen / 2) / chunkSize
-	if (dataLen/2)%chunkSize != 0 {
-		chunks++
-	}
-
-	for c := 0; c < chunks; c++ {
-		wg.Add(1)
-		start := c * chunkSize
-		end := (c + 1) * chunkSize
-		if end > (dataLen / 2) {
-			end = dataLen / 2
+	buf := make([]byte, 8192)
+	for {
+		select {
+		case <-cancelChan:
+			return nil, 0, fmt.Errorf("decode cancelled")
+		default:
 		}
 
-		go func(start, end int) {
-			defer wg.Done()
-			select {
-			case <-cancelChan:
-				errChan <- fmt.Errorf("cancelled")
-				return
-			default:
+		n, readErr := dec.Read(buf)
+		if n > 0 {
+			frames := n / frameSize
+			for i := 0; i < frames; i++ {
+				left := int16(buf[i*4+0]) | (int16(buf[i*4+1]) << 8)
+				right := int16(buf[i*4+2]) | (int16(buf[i*4+3]) << 8)
+				mono := float64(left+right) * 0.5
+				mono /= 32768.0
+				pcm = append(pcm, mono)
 			}
+			totalRead += int64(n)
 
-			chunkStartTime := time.Now()
-			sliceLen := end - start
-			tmpBuf := make([]float64, sliceLen)
-
-			rawOffset := start * 2
-			for i := 0; i < sliceLen; i++ {
-				val := int16(rawBytes[rawOffset]) | int16(rawBytes[rawOffset+1])<<8
-				tmpBuf[i] = float64(val)
-				rawOffset += 2
+			if progressFn != nil && totalSize > 0 {
+				fraction := float64(totalRead) / float64(totalSize)
+				if fraction > 1.0 {
+					fraction = 1.0
+				}
+				progressFn(fraction)
 			}
+		}
 
-			// Scale using gonum
-			floats.Scale(1.0/32768.0, tmpBuf)
-			copy(m.RawData[start:end], tmpBuf)
-
-			elapsed := time.Since(chunkStartTime)
-			logDebug("Chunk %d samples processed in %v", sliceLen, elapsed)
-
-			progress := float64(end) / float64(dataLen/2)
-			progressFn(progress)
-		}(start, end)
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, 0, fmt.Errorf("decode mp3 read error: %w", readErr)
+		}
 	}
 
-	wg.Wait()
-
-	select {
-	case err := <-errChan:
-		return fmt.Errorf("waveform analysis error: %w", err)
-	default:
-		totalElapsed := time.Since(startTotal)
-		logDebug("Total waveform analysis time: %v", totalElapsed)
-		return nil
-	}
+	return pcm, sampleRate, nil
 }
 
-// AnalyzeSpectrum performs FFT analysis
-func (m *Model) AnalyzeSpectrum(progressFn func(float64), cancelChan chan struct{}) error {
+// AnalyzeWaveform decodes MP3 data into RawData.
+func (m *Model) AnalyzeWaveform(
+	mp3Bytes []byte,
+	progressFn func(float64),
+	cancelChan chan struct{},
+) error {
+
+	startTime := time.Now()
+
+	pcmSamples, sr, err := decodeMP3ToPCM(mp3Bytes, func(frac float64) {
+		if progressFn != nil {
+			progressFn(frac * 0.95)
+		}
+	}, cancelChan)
+	if err != nil {
+		return fmt.Errorf("decode error: %w", err)
+	}
+	m.RawData = pcmSamples
+	m.SampleRate = sr
+
+	if progressFn != nil {
+		progressFn(1.0)
+	}
+
+	logDebug("AnalyzeWaveform: decoded PCM has %d samples at sr=%d (%.2f sec)",
+		len(pcmSamples), sr, float64(len(pcmSamples))/float64(sr))
+	logDebug("Waveform analysis took %v", time.Since(startTime))
+	return nil
+}
+
+// AnalyzeSpectrum runs a short-time FFT over RawData, populating FFTData + FreqBands.
+func (m *Model) AnalyzeSpectrum(
+	progressFn func(float64),
+	cancelChan chan struct{},
+) error {
+
+	if m.SampleRate <= 0 {
+		return fmt.Errorf("invalid sample rate (%d)", m.SampleRate)
+	}
 	if len(m.RawData) < m.windowSize {
 		return fmt.Errorf("insufficient data for spectrum analysis")
 	}
 
 	numWindows := (len(m.RawData) - m.windowSize) / m.hopSize
 	if numWindows < 1 {
-		return fmt.Errorf("insufficient data for spectrum analysis")
+		return fmt.Errorf("not enough samples for any FFT window")
 	}
 
 	m.initFrequencyBands()
+
 	m.FFTData = make([][]float64, numWindows)
 	for i := range m.FFTData {
 		m.FFTData[i] = make([]float64, m.fftSize/2)
 	}
 
 	realFFT := fourier.NewFFT(m.fftSize)
-
 	numCPU := runtime.NumCPU()
 	windowChan := make(chan int, numWindows)
 	errChan := make(chan error, numCPU)
 	var wg sync.WaitGroup
 
+	logDebug("Starting FFT with numWindows=%d, windowSize=%d, hopSize=%d", numWindows, m.windowSize, m.hopSize)
+
+	// Start parallel workers
 	for i := 0; i < numCPU; i++ {
 		wg.Add(1)
-		go m.fftWorker(realFFT, windowChan, &wg, progressFn, cancelChan, errChan)
+		go m.fftWorker(realFFT, windowChan, &wg, progressFn, cancelChan, errChan, numWindows)
 	}
 
+	// Feed window indices
 	go func() {
-		for i := 0; i < numWindows; i++ {
+		defer close(windowChan)
+		for w := 0; w < numWindows; w++ {
 			select {
 			case <-cancelChan:
-				close(windowChan)
 				return
 			default:
-				windowChan <- i
+				windowChan <- w
 			}
 		}
-		close(windowChan)
 	}()
 
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
 
+	// Wait for completion or cancellation
 	select {
+	case <-done:
+	case <-cancelChan:
+		return fmt.Errorf("analysis cancelled")
 	case err := <-errChan:
-		return fmt.Errorf("spectrum analysis error: %w", err)
-	default:
-		return m.calculateSpectralFeatures(cancelChan)
+		return err
 	}
+
+	// Compute spectral features
+	if err := m.calculateSpectralFeatures(cancelChan, progressFn); err != nil {
+		return err
+	}
+
+	return nil
 }
 
+// initFrequencyBands populates FreqBands up to Nyquist.
 func (m *Model) initFrequencyBands() {
 	m.FreqBands = make([]float64, m.fftSize/2)
 	nyquist := float64(m.SampleRate) / 2.0
@@ -185,6 +227,7 @@ func (m *Model) initFrequencyBands() {
 	}
 }
 
+// fftWorker applies a Hanning window, runs FFT, and stores amplitude results for a subset of frames.
 func (m *Model) fftWorker(
 	realFFT *fourier.FFT,
 	windowChan chan int,
@@ -192,30 +235,41 @@ func (m *Model) fftWorker(
 	progressFn func(float64),
 	cancelChan chan struct{},
 	errChan chan error,
+	totalWindows int,
 ) {
 	defer wg.Done()
+
 	windowed := make([]float64, m.fftSize)
+
+	logDebug("fftWorker started. totalWindows=%d", totalWindows)
 
 	for windowIdx := range windowChan {
 		select {
 		case <-cancelChan:
-			errChan <- fmt.Errorf("cancelled")
+			select {
+			case errChan <- fmt.Errorf("cancelled"):
+			default:
+			}
 			return
 		default:
 		}
 
 		startSample := windowIdx * m.hopSize
 		if startSample+m.windowSize > len(m.RawData) {
-			errChan <- fmt.Errorf("invalid window index")
+			select {
+			case errChan <- fmt.Errorf("invalid window index"):
+			default:
+			}
 			return
 		}
 
+		// Apply Hanning
 		for i := 0; i < m.fftSize; i++ {
 			if i < m.windowSize {
 				w := 0.5 * (1 - math.Cos(2*math.Pi*float64(i)/float64(m.windowSize)))
 				windowed[i] = m.RawData[startSample+i] * w
 			} else {
-				windowed[i] = 0.0
+				windowed[i] = 0
 			}
 		}
 
@@ -226,13 +280,21 @@ func (m *Model) fftWorker(
 			m.FFTData[windowIdx][freq] = math.Sqrt(re*re + im*im)
 		}
 
-		if windowIdx%(len(m.FFTData)/100+1) == 0 {
-			progressFn(float64(windowIdx) / float64(len(m.FFTData)))
+		if progressFn != nil && totalWindows > 0 {
+			if windowIdx%500 == 0 {
+				f := float64(windowIdx) / float64(totalWindows)
+				progressFn(f)
+			}
 		}
 	}
+
+	logDebug("fftWorker finished")
 }
 
-func (m *Model) calculateSpectralFeatures(cancelChan chan struct{}) error {
+// calculateSpectralFeatures extracts flux, peak frequencies, and RMS energy from the FFT slices.
+func (m *Model) calculateSpectralFeatures(cancelChan chan struct{}, progressFn func(float64)) error {
+	logDebug("calculateSpectralFeatures: starting for %d frames", len(m.FFTData))
+
 	numFrames := len(m.FFTData)
 	m.SpectralFlux = make([]float64, numFrames)
 	m.PeakFrequencies = make([]float64, numFrames)
@@ -249,6 +311,11 @@ func (m *Model) calculateSpectralFeatures(cancelChan chan struct{}) error {
 		}
 		m.PeakFrequencies[i] = m.findPeakFrequency(m.FFTData[i])
 		m.RMSEnergy[i] = m.calculateRMSEnergy(m.FFTData[i])
+	}
+	logDebug("calculateSpectralFeatures: completed")
+
+	if progressFn != nil {
+		progressFn(1.0)
 	}
 	return nil
 }
@@ -284,11 +351,20 @@ func (m *Model) calculateRMSEnergy(spectrum []float64) float64 {
 	return math.Sqrt(sumSq / float64(len(spectrum)))
 }
 
-// AnalyzeBeats performs beat and tempo analysis
-func (m *Model) AnalyzeBeats(progressFn func(float64), cancelChan chan struct{}) error {
+// AnalyzeBeats calls AnalyzeSpectrum if needed, then processes onsets to estimate tempo and refine beat info.
+func (m *Model) AnalyzeBeats(
+	progressFn func(float64),
+	cancelChan chan struct{},
+) error {
+
+	if m.SampleRate <= 0 {
+		return fmt.Errorf("invalid sample rate: %d", m.SampleRate)
+	}
 	if len(m.FFTData) == 0 {
-		err := m.AnalyzeSpectrum(func(p float64) {
-			progressFn(p * 0.5)
+		err := m.AnalyzeSpectrum(func(frac float64) {
+			if progressFn != nil {
+				progressFn(frac * 0.6)
+			}
 		}, cancelChan)
 		if err != nil {
 			return err
@@ -296,39 +372,51 @@ func (m *Model) AnalyzeBeats(progressFn func(float64), cancelChan chan struct{})
 	}
 
 	numFrames := len(m.FFTData)
+	if numFrames < 2 {
+		return fmt.Errorf("not enough FFT frames")
+	}
+
 	m.BeatData = make([]float64, numFrames)
 	m.BeatOnsets = make([]bool, numFrames)
 
 	if err := m.calculateOnsetFunction(progressFn, cancelChan); err != nil {
 		return err
 	}
+
 	return m.detectBeats(progressFn, cancelChan)
 }
 
-func (m *Model) calculateOnsetFunction(progressFn func(float64), cancelChan chan struct{}) error {
+// calculateOnsetFunction uses a rolling approach to detect transient energy for the beat envelope.
+func (m *Model) calculateOnsetFunction(
+	progressFn func(float64),
+	cancelChan chan struct{},
+) error {
+
+	numFrames := len(m.FFTData)
 	numCPU := runtime.NumCPU()
-	chunkSize := len(m.FFTData) / numCPU
+	chunkSize := numFrames / numCPU
 	if chunkSize < 1 {
-		chunkSize = 1
+		chunkSize = numFrames
 	}
 
 	var wg sync.WaitGroup
 	errChan := make(chan error, numCPU)
 
 	for i := 0; i < numCPU; i++ {
-		wg.Add(1)
 		start := i * chunkSize
 		end := (i + 1) * chunkSize
 		if i == numCPU-1 {
-			end = len(m.FFTData)
+			end = numFrames
 		}
 
-		go func(start, end int) {
+		wg.Add(1)
+		go func(s, e int) {
 			defer wg.Done()
-			history := make([]float64, 43)
-			histPos := 0
 
-			for idx := start; idx < end; idx++ {
+			history := make([]float64, 43)
+			hPos := 0
+
+			for idx := s; idx < e; idx++ {
 				select {
 				case <-cancelChan:
 					errChan <- fmt.Errorf("cancelled")
@@ -337,40 +425,60 @@ func (m *Model) calculateOnsetFunction(progressFn func(float64), cancelChan chan
 				}
 				var energy float64
 				for freq := 0; freq < len(m.FFTData[idx]); freq++ {
+					// Accumulate lower-frequency energy (heuristic for onset)
 					if freq < m.fftSize/4 {
 						energy += m.FFTData[idx][freq] * m.FFTData[idx][freq]
 					}
 				}
 				energy = math.Sqrt(energy)
+
 				m.BeatData[idx] = energy
-				history[histPos] = energy
-				histPos = (histPos + 1) % len(history)
+				history[hPos] = energy
+				hPos = (hPos + 1) % len(history)
 
 				var sum, count float64
-				for _, e := range history {
-					if e > 0 {
-						sum += e
+				for _, eVal := range history {
+					if eVal > 0 {
+						sum += eVal
 						count++
 					}
 				}
-				threshold := (sum / count) * 1.3
-				m.BeatOnsets[idx] = energy > threshold
+				if count > 0 {
+					threshold := (sum / count) * 1.3
+					m.BeatOnsets[idx] = energy > threshold
+				}
 			}
 
-			localProgress := float64(end-start) / float64(len(m.FFTData))
-			progressFn(0.5 + localProgress*0.5)
+			if progressFn != nil && numFrames > 0 {
+				localFrac := float64(e-s) / float64(numFrames)
+				progressFn(0.6 + localFrac*0.2)
+			}
 		}(start, end)
 	}
 
-	wg.Wait()
+	waitDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitDone)
+	}()
+
 	select {
-	case err := <-errChan:
-		return err
-	default:
-		return nil
+	case <-waitDone:
+		select {
+		case e := <-errChan:
+			return e
+		default:
+		}
+	case <-cancelChan:
+		return fmt.Errorf("cancelled")
+	case e := <-errChan:
+		return e
 	}
+
+	return nil
 }
 
+// detectBeats uses a basic interval histogram approach to guess BPM, then refines onsets.
 func (m *Model) detectBeats(progressFn func(float64), cancelChan chan struct{}) error {
 	intervals := make([]float64, 0, len(m.BeatOnsets)/2)
 	lastBeat := -1
@@ -386,17 +494,20 @@ func (m *Model) detectBeats(progressFn func(float64), cancelChan chan struct{}) 
 
 	if len(intervals) == 0 {
 		m.EstimatedTempo = 120.0
+		if progressFn != nil {
+			progressFn(1.0)
+		}
 		return nil
 	}
 
 	hist := make(map[int]int)
-	for _, interval := range intervals {
-		bucket := int(math.Round(interval))
-		hist[bucket]++
+	for _, iv := range intervals {
+		b := int(math.Round(iv))
+		hist[b]++
 	}
 
-	maxCount := 0
 	bestInterval := 0
+	maxCount := 0
 	for iv, count := range hist {
 		if count > maxCount {
 			maxCount = count
@@ -415,21 +526,34 @@ func (m *Model) detectBeats(progressFn func(float64), cancelChan chan struct{}) 
 	} else {
 		m.EstimatedTempo = 120.0
 	}
+
+	if progressFn != nil {
+		progressFn(1.0)
+	}
 	return nil
 }
 
+// refineBeatDetection tries to align onsets to a consistent BPM for a more stable “beat” visualization.
 func (m *Model) refineBeatDetection(progressFn func(float64), cancelChan chan struct{}) {
-	framesPerBeat := (60.0 / m.EstimatedTempo) * (float64(m.SampleRate) / float64(m.hopSize))
+	framesPerBeat := (60.0 / m.EstimatedTempo) *
+		(float64(m.SampleRate) / float64(m.hopSize))
+	if framesPerBeat <= 0 {
+		return
+	}
+
 	searchWindow := int(framesPerBeat * 0.1)
 	refined := make([]bool, len(m.BeatOnsets))
 
-	var firstBeat int
+	firstBeat := -1
 	for i, isBeat := range m.BeatOnsets {
 		if isBeat {
 			firstBeat = i
 			refined[i] = true
 			break
 		}
+	}
+	if firstBeat < 0 {
+		return
 	}
 
 	expectedPos := float64(firstBeat)
@@ -439,7 +563,11 @@ func (m *Model) refineBeatDetection(progressFn func(float64), cancelChan chan st
 			return
 		default:
 		}
+
 		pos := int(math.Round(expectedPos))
+		if pos < 0 || pos >= len(m.BeatOnsets) {
+			break
+		}
 		start := pos - searchWindow
 		if start < 0 {
 			start = 0
@@ -449,23 +577,25 @@ func (m *Model) refineBeatDetection(progressFn func(float64), cancelChan chan st
 			end = len(m.BeatOnsets) - 1
 		}
 
-		maxEnergy := 0.0
+		maxE := 0.0
 		maxPos := pos
 		for i := start; i <= end; i++ {
-			if m.BeatData[i] > maxEnergy {
-				maxEnergy = m.BeatData[i]
+			if m.BeatData[i] > maxE {
+				maxE = m.BeatData[i]
 				maxPos = i
 			}
 		}
 		threshold := m.calculateLocalThreshold(maxPos)
-		if maxEnergy > threshold {
+		if maxE > threshold {
 			refined[maxPos] = true
 		}
 		expectedPos += framesPerBeat
 	}
+
 	m.BeatOnsets = refined
 }
 
+// calculateLocalThreshold returns a local average + standard deviation threshold for peak detection.
 func (m *Model) calculateLocalThreshold(pos int) float64 {
 	windowSize := 43
 	start := pos - windowSize/2
@@ -476,11 +606,13 @@ func (m *Model) calculateLocalThreshold(pos int) float64 {
 	if end >= len(m.BeatData) {
 		end = len(m.BeatData) - 1
 	}
-
 	var sum, count float64
 	for i := start; i <= end; i++ {
 		sum += m.BeatData[i]
 		count++
+	}
+	if count == 0 {
+		return 0
 	}
 	mean := sum / count
 	var variance float64
@@ -493,56 +625,77 @@ func (m *Model) calculateLocalThreshold(pos int) float64 {
 	return mean + 1.5*stdDev
 }
 
+// Utility: GetBeatTimes returns the times at which each beat occurs, for reference.
 func (m *Model) GetBeatTimes() []time.Duration {
-	var result []time.Duration
+	if m.SampleRate <= 0 {
+		return nil
+	}
+	var beats []time.Duration
 	frameDur := time.Duration(float64(m.hopSize) / float64(m.SampleRate) * float64(time.Second))
 	for i, isBeat := range m.BeatOnsets {
 		if isBeat {
-			result = append(result, time.Duration(i)*frameDur)
+			beats = append(beats, time.Duration(i)*frameDur)
 		}
 	}
-	return result
+	return beats
 }
 
-func (m *Model) GetFrequencyResponse(timestamp time.Duration) []float64 {
-	frameIndex := int(timestamp.Seconds() * float64(m.SampleRate) / float64(m.hopSize))
-	if frameIndex < 0 || frameIndex >= len(m.FFTData) {
+// GetFrequencyResponse returns the FFT frequency bins at a particular time offset.
+func (m *Model) GetFrequencyResponse(ts time.Duration) []float64 {
+	if m.SampleRate <= 0 || m.hopSize <= 0 {
 		return nil
 	}
-	return m.FFTData[frameIndex]
+	index := int(ts.Seconds() * float64(m.SampleRate) / float64(m.hopSize))
+	if index < 0 || index >= len(m.FFTData) {
+		return nil
+	}
+	return m.FFTData[index]
 }
 
+// GetEnvelopeSegment returns a slice of RMS energy between two timestamps, for advanced use.
 func (m *Model) GetEnvelopeSegment(start, end time.Duration) []float64 {
-	startFrame := int(start.Seconds() * float64(m.SampleRate) / float64(m.hopSize))
-	endFrame := int(end.Seconds() * float64(m.SampleRate) / float64(m.hopSize))
+	if m.SampleRate <= 0 || m.hopSize <= 0 {
+		return nil
+	}
+	startIndex := int(start.Seconds() * float64(m.SampleRate) / float64(m.hopSize))
+	endIndex := int(end.Seconds() * float64(m.SampleRate) / float64(m.hopSize))
 
-	if startFrame < 0 {
-		startFrame = 0
+	if startIndex < 0 {
+		startIndex = 0
 	}
-	if endFrame >= len(m.RMSEnergy) {
-		endFrame = len(m.RMSEnergy) - 1
+	if endIndex >= len(m.RMSEnergy) {
+		endIndex = len(m.RMSEnergy) - 1
 	}
-	return m.RMSEnergy[startFrame:endFrame]
+	if startIndex > endIndex {
+		return nil
+	}
+	return m.RMSEnergy[startIndex:endIndex]
 }
 
+// GetSpectralCentroid returns an array of frequency centroids for frames within [start, end].
 func (m *Model) GetSpectralCentroid(start, end time.Duration) []float64 {
+	if m.SampleRate <= 0 || m.hopSize <= 0 {
+		return nil
+	}
 	startFrame := int(start.Seconds() * float64(m.SampleRate) / float64(m.hopSize))
 	endFrame := int(end.Seconds() * float64(m.SampleRate) / float64(m.hopSize))
-
 	if startFrame < 0 {
 		startFrame = 0
 	}
 	if endFrame >= len(m.FFTData) {
 		endFrame = len(m.FFTData) - 1
 	}
+	if startFrame > endFrame {
+		return nil
+	}
 
 	centroids := make([]float64, endFrame-startFrame)
 	for i := range centroids {
 		var weightedSum, total float64
 		for j, freq := range m.FreqBands {
-			e := m.FFTData[startFrame+i][j]
-			weightedSum += freq * e
-			total += e
+			val := m.FFTData[startFrame+i][j]
+			weightedSum += freq * val
+			total += val
 		}
 		if total > 0 {
 			centroids[i] = weightedSum / total

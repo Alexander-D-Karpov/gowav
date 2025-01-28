@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// CompletionType enumerates the kind of completions we're doing
+// CompletionType determines which category of completions (commands, file paths, etc.) we’re handling.
 type CompletionType int
 
 const (
@@ -19,7 +19,7 @@ const (
 	CompletionPlayback
 )
 
-// TabState holds info about completions in-progress
+// TabState holds the current state of partial completions in progress, such as which suggestion index we’re on.
 type TabState struct {
 	Completions   []string
 	CurrentIndex  int
@@ -30,7 +30,7 @@ type TabState struct {
 	Type          CompletionType
 }
 
-// CompletionDef defines a command and its completion behavior
+// CompletionDef records info about a particular command, including aliases and subCommands (e.g., viz wave).
 type CompletionDef struct {
 	Command     string
 	Aliases     []string
@@ -39,6 +39,7 @@ type CompletionDef struct {
 	Description string
 }
 
+// completionDefs is the table of known commands we can suggest when the user presses <Tab>.
 var completionDefs = []CompletionDef{
 	{
 		Command:     "load",
@@ -91,20 +92,21 @@ var completionDefs = []CompletionDef{
 	},
 }
 
+// handleTabCompletion decides how to autocomplete the user’s input, depending on whether it’s a command or subcommand.
 func (m *AudioModel) handleTabCompletion() {
 	input := m.input.Value()
 
-	// If empty, list everything
+	// If the user typed nothing, suggest all commands.
 	if input == "" {
 		m.handleCommandCompletion("")
 		return
 	}
 
-	// Split into first token (command) plus the rest
+	// Split into first token (potential command) plus remainder.
 	parts := strings.Fields(input)
 	cmd := strings.ToLower(parts[0])
 
-	// Identify if this is a known command or alias
+	// Check if this token matches a known command or alias from completionDefs.
 	var matchingDef *CompletionDef
 	for _, def := range completionDefs {
 		if cmd == def.Command || contains(def.Aliases, cmd) {
@@ -113,13 +115,13 @@ func (m *AudioModel) handleTabCompletion() {
 		}
 	}
 
+	// If we did not find a known command, we try to complete the command itself.
 	if matchingDef == nil {
-		// No known command => try to complete the command itself
 		m.handleCommandCompletion(cmd)
 		return
 	}
 
-	// If we found a known command, do completion by type
+	// Depending on the type (File, Visualization, etc.), handle completions.
 	switch matchingDef.Type {
 	case CompletionFile:
 		m.handleFileCompletion(matchingDef, parts)
@@ -127,19 +129,21 @@ func (m *AudioModel) handleTabCompletion() {
 		m.handleVizCompletion(matchingDef, parts)
 	case CompletionCommand:
 		if len(parts) == 1 {
+			// Possibly complete subcommands or just show commands.
 			m.handleCommandCompletion(cmd)
 		}
 	case CompletionPlayback:
 		if len(parts) == 1 {
+			// Typically no subcommand for simple playback, so we clear.
 			m.clearTabCompletion()
 		}
 	}
 }
 
+// handleCommandCompletion tries to complete the first token as a known command (including aliases).
 func (m *AudioModel) handleCommandCompletion(partial string) {
 	var completions []string
 
-	// For each known command definition
 	for _, def := range completionDefs {
 		if strings.HasPrefix(def.Command, partial) {
 			completions = append(completions, def.Command)
@@ -160,6 +164,7 @@ func (m *AudioModel) handleCommandCompletion(partial string) {
 	m.updateTabState(completions, CompletionCommand, "", "")
 }
 
+// handleVizCompletion autocompletes subcommands like "viz wave", "viz spectrum", etc.
 func (m *AudioModel) handleVizCompletion(def *CompletionDef, parts []string) {
 	var partial string
 	if len(parts) > 1 {
@@ -178,6 +183,7 @@ func (m *AudioModel) handleVizCompletion(def *CompletionDef, parts []string) {
 		return
 	}
 
+	// Check if we’re starting fresh or cycling through the same set of suggestions again.
 	isNew := m.tabState == nil ||
 		m.tabState.Command != parts[0] ||
 		m.tabState.Type != CompletionVisualization
@@ -192,7 +198,7 @@ func (m *AudioModel) handleVizCompletion(def *CompletionDef, parts []string) {
 			Type:          CompletionVisualization,
 		}
 	} else {
-		// Cycle through existing completions
+		// Cycle to the next suggestion if user pressed Tab repeatedly.
 		m.tabState.CurrentIndex = (m.tabState.CurrentIndex + 1) % len(completions)
 		m.tabState.HasTabbed = true
 	}
@@ -201,6 +207,7 @@ func (m *AudioModel) handleVizCompletion(def *CompletionDef, parts []string) {
 	m.formatCompletionsDisplay()
 }
 
+// handleFileCompletion attempts to tab-complete a file path for commands like “load <file>”.
 func (m *AudioModel) handleFileCompletion(def *CompletionDef, parts []string) {
 	path := "."
 	if len(parts) > 1 {
@@ -208,7 +215,7 @@ func (m *AudioModel) handleFileCompletion(def *CompletionDef, parts []string) {
 		path = strings.Trim(path, `"'`)
 	}
 
-	// Expand ~
+	// Expand tilde (~) if present.
 	if strings.HasPrefix(path, "~") {
 		if homeDir, err := os.UserHomeDir(); err == nil {
 			path = strings.Replace(path, "~", homeDir, 1)
@@ -223,6 +230,7 @@ func (m *AudioModel) handleFileCompletion(def *CompletionDef, parts []string) {
 	m.updateTabState(completions, CompletionFile, path, parts[0])
 }
 
+// updateTabState either initializes or advances the current TabState with a new list of completions.
 func (m *AudioModel) updateTabState(completions []string, compType CompletionType, path, cmd string) {
 	isNew := m.tabState == nil ||
 		path != m.tabState.CurrentPath ||
@@ -240,6 +248,7 @@ func (m *AudioModel) updateTabState(completions []string, compType CompletionTyp
 			Type:          compType,
 		}
 	} else if m.tabState.HasTabbed {
+		// If the user hit Tab again, move to the next suggestion.
 		m.tabState.CurrentIndex = (m.tabState.CurrentIndex + 1) % len(completions)
 	}
 
@@ -248,6 +257,7 @@ func (m *AudioModel) updateTabState(completions []string, compType CompletionTyp
 	m.formatCompletionsDisplay()
 }
 
+// updateInputWithCompletion replaces the current input text with the selected suggestion.
 func (m *AudioModel) updateInputWithCompletion() {
 	if m.tabState == nil || len(m.tabState.Completions) == 0 {
 		return
@@ -264,10 +274,13 @@ func (m *AudioModel) updateInputWithCompletion() {
 		m.input.SetValue(fmt.Sprintf("%s %s", m.tabState.Command, current))
 	case CompletionVisualization:
 		m.input.SetValue(fmt.Sprintf("%s %s", m.tabState.Command, current))
+	default:
+		// For other types (e.g. no completions), do nothing special.
 	}
 	m.input.CursorEnd()
 }
 
+// formatCompletionsDisplay builds a multi-column display of the current list of completions for the user.
 func (m *AudioModel) formatCompletionsDisplay() {
 	if m.tabState == nil || len(m.tabState.Completions) == 0 {
 		m.tabOutput = ""
@@ -294,7 +307,7 @@ func (m *AudioModel) formatCompletionsDisplay() {
 		}
 	}
 
-	// We will attempt a multi-column display
+	// Decide how many columns we can fit on one line.
 	itemWidth := maxWidth + 4
 	columns := (m.width - 4) / itemWidth
 	if columns < 1 {
@@ -302,13 +315,16 @@ func (m *AudioModel) formatCompletionsDisplay() {
 	}
 
 	for i, completion := range m.tabState.Completions {
+		// For file completion, just show the basename plus a trailing slash if it’s a directory.
 		name := completion
 		if m.tabState.Type == CompletionFile {
-			name = filepath.Base(completion)
-			if strings.HasSuffix(completion, "/") {
-				name += "/"
+			base := filepath.Base(completion)
+			if strings.HasSuffix(completion, string(os.PathSeparator)) {
+				base += "/"
 			}
+			name = base
 		}
+
 		if i == m.tabState.CurrentIndex {
 			sb.WriteString("> ")
 		} else {
@@ -316,8 +332,8 @@ func (m *AudioModel) formatCompletionsDisplay() {
 		}
 		sb.WriteString(name)
 
+		// If this is a command completion, we can also show a brief description to the right.
 		if m.tabState.Type == CompletionCommand {
-			// If command, show short description
 			for _, def := range completionDefs {
 				if def.Command == name || contains(def.Aliases, name) {
 					padding := strings.Repeat(" ", maxWidth-len(name)+2)
@@ -327,6 +343,7 @@ func (m *AudioModel) formatCompletionsDisplay() {
 			}
 			sb.WriteString("\n")
 		} else {
+			// Try a multi-column layout
 			if (i+1)%columns != 0 && i < len(m.tabState.Completions)-1 {
 				padding := strings.Repeat(" ", itemWidth-len(name)-2)
 				sb.WriteString(padding)
@@ -338,12 +355,13 @@ func (m *AudioModel) formatCompletionsDisplay() {
 	m.tabOutput = sb.String()
 }
 
+// clearTabCompletion resets our TabState and hides the completions display.
 func (m *AudioModel) clearTabCompletion() {
 	m.tabState = nil
 	m.tabOutput = ""
 }
 
-// Helper to see if a string is in a slice
+// contains checks if a slice of strings has a particular string.
 func contains(slice []string, str string) bool {
 	for _, s := range slice {
 		if s == str {
@@ -353,7 +371,7 @@ func contains(slice []string, str string) bool {
 	return false
 }
 
-// getFilesystemCompletions returns possible file completions.
+// getFilesystemCompletions scans a local directory for matches that start with the user’s partial path.
 func getFilesystemCompletions(path string) []string {
 	dir := filepath.Dir(path)
 	if dir == "." {
@@ -372,6 +390,7 @@ func getFilesystemCompletions(path string) []string {
 			continue
 		}
 		fullPath := filepath.Join(dir, name)
+
 		if entry.IsDir() {
 			completions = append(completions, fullPath+string(os.PathSeparator))
 		} else if isAudioFile(name) {
@@ -382,7 +401,7 @@ func getFilesystemCompletions(path string) []string {
 	return completions
 }
 
-// isAudioFile is a minimal extension check
+// isAudioFile does a quick extension check for recognized audio formats.
 func isAudioFile(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {

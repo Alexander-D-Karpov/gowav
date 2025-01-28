@@ -7,6 +7,7 @@ import (
 	"github.com/hajimehoshi/go-mp3"
 )
 
+// AudioProperties holds basic format details like duration or sample rate.
 type AudioProperties struct {
 	Duration   time.Duration
 	SampleRate int
@@ -14,6 +15,7 @@ type AudioProperties struct {
 	BitRate    int
 }
 
+// extractAudioProperties attempts to read an MP3 stream to find duration, sample rate, and so forth.
 func extractAudioProperties(reader io.ReadSeeker) (AudioProperties, error) {
 	props := AudioProperties{}
 	dec, err := mp3.NewDecoder(reader)
@@ -39,6 +41,5 @@ func extractAudioProperties(reader io.ReadSeeker) (AudioProperties, error) {
 		props.Duration = time.Duration(durSeconds * float64(time.Second))
 		return props, nil
 	}
-
 	return props, nil
 }

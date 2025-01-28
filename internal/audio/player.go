@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// PlaybackState enumerates whether the track is playing, paused, or stopped.
 type PlaybackState int
 
 const (
@@ -16,6 +17,7 @@ const (
 	StatePaused
 )
 
+// Player holds the audio playback context and position/duration information.
 type Player struct {
 	mutex       sync.Mutex
 	context     *oto.Context
@@ -29,6 +31,7 @@ type Player struct {
 	lastUpdate  time.Time
 }
 
+// NewPlayer creates a Player with default sampleRate=44100, stereo.
 func NewPlayer() *Player {
 	return &Player{
 		state:       StateStopped,
@@ -38,6 +41,7 @@ func NewPlayer() *Player {
 	}
 }
 
+// Play writes the provided data to the Oto player. If already playing, does nothing.
 func (p *Player) Play(data []byte) error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -54,6 +58,7 @@ func (p *Player) Play(data []byte) error {
 		p.context = ctx
 	}
 
+	// If resuming from paused, skip re-buffer. Otherwise, create new Oto player.
 	if p.state != StatePaused {
 		if p.player != nil {
 			p.player.Close()
@@ -71,6 +76,7 @@ func (p *Player) Play(data []byte) error {
 	return nil
 }
 
+// Pause halts playback but retains the current track position for potential resume.
 func (p *Player) Pause() error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -88,6 +94,7 @@ func (p *Player) Pause() error {
 	return nil
 }
 
+// Stop fully resets playback and position.
 func (p *Player) Stop() error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -102,12 +109,14 @@ func (p *Player) Stop() error {
 	return nil
 }
 
+// GetState returns whether the player is playing, paused, or stopped.
 func (p *Player) GetState() PlaybackState {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	return p.state
 }
 
+// GetPosition returns the current playback position.
 func (p *Player) GetPosition() time.Duration {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -117,6 +126,7 @@ func (p *Player) GetPosition() time.Duration {
 	return p.position
 }
 
+// updatePosition accumulates how long we've been playing since lastUpdate.
 func (p *Player) updatePosition() {
 	if p.state == StatePlaying {
 		elapsed := time.Since(p.lastUpdate)
@@ -125,18 +135,21 @@ func (p *Player) updatePosition() {
 	}
 }
 
+// SetDuration allows the Player to show the correct total track length for UI displays.
 func (p *Player) SetDuration(d time.Duration) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	p.duration = d
 }
 
+// GetDuration returns the total duration of the track, if known.
 func (p *Player) GetDuration() time.Duration {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	return p.duration
 }
 
+// RenderTrackBar draws a simple text-based “progress bar” for the track’s current position.
 func (p *Player) RenderTrackBar(width int) string {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -181,6 +194,7 @@ func (p *Player) RenderTrackBar(width int) string {
 	return bar.String()
 }
 
+// RefreshPosition updates the player's position if it is playing.
 func (p *Player) RefreshPosition() {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()

@@ -21,6 +21,7 @@ import (
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
+// Metadata holds extracted ID3 or tag information for an audio track.
 type Metadata struct {
 	Title       string
 	Artist      string
@@ -50,6 +51,7 @@ type Metadata struct {
 	RawTags     map[string]interface{}
 }
 
+// ExtractMetadata reads tags (e.g. ID3) and basic audio info (duration, sample rate, etc.) from raw MP3 data.
 func ExtractMetadata(data []byte) (*Metadata, error) {
 	reader := bytes.NewReader(data)
 	m, err := tag.ReadFrom(reader)
@@ -67,6 +69,7 @@ func ExtractMetadata(data []byte) (*Metadata, error) {
 		AlbumArtist: tryDecode(m.AlbumArtist()),
 	}
 
+	// Attempt to decode as MP3 to get sample rate, approximate duration, etc.
 	reader.Seek(0, io.SeekStart)
 	decoder, err := mp3.NewDecoder(reader)
 	if err == nil {
@@ -75,7 +78,8 @@ func ExtractMetadata(data []byte) (*Metadata, error) {
 		for {
 			n, readErr := decoder.Read(buf)
 			if n > 0 {
-				totalPCMFrames += int64(n / 4) // 4 bytes per stereo frame
+				// 4 bytes per stereo frame (16-bit left + 16-bit right)
+				totalPCMFrames += int64(n / 4)
 			}
 			if readErr == io.EOF {
 				break
@@ -93,6 +97,7 @@ func ExtractMetadata(data []byte) (*Metadata, error) {
 		}
 	}
 
+	// If Raw() is not nil, we can read specific ID3 frames/tags.
 	if rawTags := m.Raw(); rawTags != nil {
 		metadata.RawTags = rawTags
 		metadata.Track = getStringTag(rawTags, "TRCK")
@@ -159,74 +164,25 @@ func ExtractMetadata(data []byte) (*Metadata, error) {
 	return metadata, nil
 }
 
-// BuildLoadInfo gives a “partial table.” If we’re wide enough, put artwork on the right.
+// BuildLoadInfo returns a “partial table” of metadata, plus optional artwork info if large enough.
 func (m *Metadata) BuildLoadInfo(termWidth, termHeight int) string {
-	// If the user’s terminal is at least this wide, we do side‐by‐side
-	const neededForSideBySide = 60
+	// Ensure minimal sizes
 	if termWidth < 30 {
 		termWidth = 30
 	}
 	if termHeight < 10 {
 		termHeight = 10
 	}
-
 	tableStr := m.renderTable(termWidth-2, false, true)
-
-	if !m.HasArtwork || m.Artwork == nil || termWidth < neededForSideBySide {
-		// Not enough columns => artwork on top, then table
-		if m.HasArtwork && m.Artwork != nil {
-			artStr := m.renderArtworkColorBlocks(termWidth-4, termHeight/2)
-			return artStr + "\n" + tableStr
-		}
-		return tableStr
-	}
-
-	// Enough columns => side by side
-	linesTable := strings.Split(tableStr, "\n")
-	artStr := m.renderArtworkColorBlocks(30, termHeight-4)
-	linesArt := strings.Split(artStr, "\n")
-
-	maxLines := len(linesTable)
-	if len(linesArt) > maxLines {
-		maxLines = len(linesArt)
-	}
-
-	// measure max line length from the table
-	maxTableWidth := 0
-	for _, ln := range linesTable {
-		if len(ln) > maxTableWidth {
-			maxTableWidth = len(ln)
-		}
-	}
-	sideSpacing := maxTableWidth + 2
-
-	var sb strings.Builder
-	for i := 0; i < maxLines; i++ {
-		var left, right string
-		if i < len(linesTable) {
-			left = linesTable[i]
-		}
-		if i < len(linesArt) {
-			right = linesArt[i]
-		}
-
-		sb.WriteString(left)
-		if len(left) < sideSpacing {
-			sb.WriteString(strings.Repeat(" ", sideSpacing-len(left)))
-		} else {
-			sb.WriteString(" ")
-		}
-		sb.WriteString(right)
-		sb.WriteString("\n")
-	}
-	return sb.String()
+	return tableStr
 }
 
-// AdaptiveStringWithRaw: full table + raw tags, ignoring side-by-side logic
+// AdaptiveStringWithRaw renders a full metadata table plus raw tags if available, ignoring side-by-side logic.
 func (m *Metadata) AdaptiveStringWithRaw(termWidth, termHeight int) string {
 	return m.renderTable(termWidth-2, true, false)
 }
 
+// renderTable composes a text-based table of metadata fields.
 func (m *Metadata) renderTable(width int, includeRaw bool, includeArtworkMeta bool) string {
 	if width < 20 {
 		width = 20
@@ -235,6 +191,7 @@ func (m *Metadata) renderTable(width int, includeRaw bool, includeArtworkMeta bo
 	headerWidth := width
 	b := new(bytes.Buffer)
 
+	// Top border
 	topBorder := "┌" + strings.Repeat("─", headerWidth) + "┐\n"
 	b.WriteString(topBorder)
 
@@ -300,6 +257,7 @@ func (m *Metadata) renderTable(width int, includeRaw bool, includeArtworkMeta bo
 		writeInfoSection(b, "Dimensions", fmt.Sprintf("%dx%d", m.ArtworkSize.X, m.ArtworkSize.Y), headerWidth)
 	}
 
+	// If requested, show raw tags
 	if includeRaw && len(m.RawTags) > 0 {
 		b.WriteString(sep)
 		rawTitle := "RAW TAGS"
@@ -327,6 +285,7 @@ func (m *Metadata) renderTable(width int, includeRaw bool, includeArtworkMeta bo
 	return b.String()
 }
 
+// renderArtworkColorBlocks is not used in the main TUI code but can show a color block for artwork.
 func (m *Metadata) renderArtworkColorBlocks(targetWidth, targetHeight int) string {
 	if !m.HasArtwork || m.Artwork == nil {
 		return ""
@@ -373,12 +332,14 @@ func (m *Metadata) renderArtworkColorBlocks(targetWidth, targetHeight int) strin
 	return sb.String()
 }
 
+// extractAndSetArtwork attempts to parse image bytes (JPEG/PNG) and update metadata fields accordingly.
 func extractAndSetArtwork(metadata *Metadata, data []byte, mimeType string) error {
 	logDebug("Image data starts with bytes: % x", data[:min(16, len(data))])
 	if len(data) < 12 {
 		return fmt.Errorf("data too short for image")
 	}
 
+	// Try to find a known header if the data is not starting with standard JPEG/PNG signatures
 	var imgData []byte
 	switch {
 	case bytes.HasPrefix(data, []byte{0xff, 0xd8, 0xff}):
@@ -397,9 +358,11 @@ func extractAndSetArtwork(metadata *Metadata, data []byte, mimeType string) erro
 		}
 	}
 
-	var img image.Image
-	var format string
-	var err error
+	var (
+		img    image.Image
+		format string
+		err    error
+	)
 
 	if img, err = jpeg.Decode(bytes.NewReader(imgData)); err == nil {
 		format = "jpeg"
@@ -427,6 +390,7 @@ func extractAndSetArtwork(metadata *Metadata, data []byte, mimeType string) erro
 	return nil
 }
 
+// getRawBytes attempts to convert an unknown interface into a byte slice.
 func getRawBytes(data interface{}) ([]byte, bool) {
 	if str, ok := data.(string); ok {
 		return []byte(str), true
@@ -444,6 +408,7 @@ func min(a, b int) int {
 	return b
 }
 
+// tryDecode attempts to fix incorrectly-encoded strings by testing various encodings.
 func tryDecode(s string) string {
 	if s == "" {
 		return s
@@ -466,6 +431,7 @@ func tryDecode(s string) string {
 	return s
 }
 
+// getStringTag tries to extract a string from a map of raw tags, handling possible array types, etc.
 func getStringTag(tags map[string]interface{}, key string) string {
 	if val, ok := tags[key]; ok {
 		switch v := val.(type) {
@@ -486,6 +452,7 @@ func getStringTag(tags map[string]interface{}, key string) string {
 	return ""
 }
 
+// writeInfoSection is a helper for rendering a label-value row in the ASCII table.
 func writeInfoSection(b *bytes.Buffer, label, value string, width int) {
 	if value == "" {
 		return
@@ -505,6 +472,7 @@ func writeInfoSection(b *bytes.Buffer, label, value string, width int) {
 	fmt.Fprintf(b, "│ %-*s│ %-*s │\n", labelWidth, label, valueWidth, value)
 }
 
+// formatDuration formats a duration as HH:MM:SS or MM:SS if under 1 hour.
 func formatDuration(d time.Duration) string {
 	d = d.Round(time.Second)
 	h := d / time.Hour
@@ -518,6 +486,7 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
+// formatFileSize returns a human-readable file size string, e.g. "3.2 MB".
 func formatFileSize(size int64) string {
 	const unit = 1024
 	if size < unit {

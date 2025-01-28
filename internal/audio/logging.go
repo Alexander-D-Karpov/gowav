@@ -9,6 +9,7 @@ import (
 
 var logFile *os.File
 
+// initLogging opens a timestamped log file in the user’s home directory (~/.gowav/logs).
 func initLogging() error {
 	if logFile != nil {
 		return nil
@@ -36,6 +37,7 @@ func initLogging() error {
 	return nil
 }
 
+// logDebug writes a debug-level message to the log file, if it’s successfully opened.
 func logDebug(format string, args ...interface{}) {
 	if err := initLogging(); err != nil {
 		return
