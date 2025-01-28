@@ -107,3 +107,7 @@ func (c *Commander) Execute(input string) (string, error, tea.Cmd) {
 	}
 	return c.handleNormalCommand(cmd, args)
 }
+
+func (c *Commander) GetPlayer() *audio.Player {
+	return c.player
+}

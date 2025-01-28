@@ -2,247 +2,246 @@ package ui
 
 import (
 	"fmt"
-	"gowav/internal/types"
+	"gowav/internal/audio"
+	"gowav/internal/commands"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"gowav/internal/audio"
 )
 
-// progressMsg is a bubble for manual progress commands if you ever want them.
+// downloadMsg is used for streaming or downloading progress updates.
+type downloadMsg struct {
+	url      string
+	progress float64
+	err      error
+}
+
+// progressMsg is for manual progress (rarely used).
 type progressMsg float64
 
-// Update is the main update function for our TUI’s bubbletea loop.
+// Update is the main TUI update loop, handling user inputs and state changes.
 func (m AudioModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
-	case streamMsg:
-		newModel, cmd := m.updateStreamProgress(msg)
-		return newModel, cmd
 
-	case progressMsg:
-		var cmd tea.Cmd
-		newProgress, cmd := m.progress.Update(float64(msg))
-		m.progress = newProgress.(progress.Model)
-		return m, cmd
-
-	case types.EnterVizMsg:
-		m.uiMode = ModeViz
-		m.currentVizMode = msg.Mode
+	//----------------------------------------------------------------------
+	// Our custom ShowFullInfoMsg from commands/info.go
+	//----------------------------------------------------------------------
+	case commands.ShowFullInfoMsg:
+		// The user typed ":info"; we switch to full metadata mode
+		m.showFullInfo = true
+		if meta := m.commander.GetProcessor().GetMetadata(); meta != nil {
+			m.mainOutput = m.BuildMetadataOutput(meta)
+		}
 		return m, nil
 
 	//----------------------------------------------------------------------
-	// Bubble Tea key events
+	// downloadMsg: streaming or download progress
+	//----------------------------------------------------------------------
+	case downloadMsg:
+		if msg.err != nil {
+			m.loadingState.IsLoading = false
+			m.mainOutput = fmt.Sprintf("Download/Stream error: %v", msg.err)
+			return m, nil
+		}
+		m.loadingState.IsLoading = true
+		m.loadingState.Message = fmt.Sprintf("Downloading... %.1f%%", msg.progress*100)
+		m.loadingState.Progress = msg.progress
+		if msg.progress >= 1.0 {
+			m.loadingState.IsLoading = false
+			m.mainOutput = "Download complete."
+		}
+		return m, nil
+
+	case progressMsg:
+		var _ tea.Cmd
+		newProg, c2 := m.progress.Update(float64(msg))
+		m.progress = newProg.(progress.Model)
+		cmds = append(cmds, c2)
+		return m, tea.Batch(cmds...)
+
+	//----------------------------------------------------------------------
+	// Key events
 	//----------------------------------------------------------------------
 	case tea.KeyMsg:
-		// If we are in visualization mode, interpret certain keys for scrolling/zooming/quit:
 		if m.uiMode == ModeViz && m.commander.IsInTrackMode() {
+			// Visualization shortcuts
 			switch msg.String() {
 			case "esc", "q":
 				m.uiMode = ModeFull
 				return m, nil
-
 			case "tab":
 				m.commander.GetProcessor().HandleVisualizationInput("next")
 				return m, nil
-
 			case "shift+tab":
 				m.commander.GetProcessor().HandleVisualizationInput("prev")
 				return m, nil
-
 			case "+", "=":
 				m.commander.GetProcessor().HandleVisualizationInput("zoom-in")
 				return m, nil
-
 			case "-", "_":
 				m.commander.GetProcessor().HandleVisualizationInput("zoom-out")
 				return m, nil
-
 			case "left", "h":
 				m.commander.GetProcessor().HandleVisualizationInput("left")
 				return m, nil
-
 			case "right", "l":
 				m.commander.GetProcessor().HandleVisualizationInput("right")
 				return m, nil
-
 			case "0":
 				m.commander.GetProcessor().HandleVisualizationInput("reset")
 				return m, nil
-
-				// Let “enter” or other editing keys fall through to normal input:
 			}
 		}
 
+		// Normal keys
 		switch msg.Type {
 		case tea.KeyCtrlC:
-			// If loading or analyzing can be canceled, do so:
+			// Possibly cancel load
 			if m.loadingState.IsLoading && m.loadingState.CanCancel {
-				if m.commander.GetProcessor() != nil {
-					m.commander.GetProcessor().CancelProcessing()
-				}
+				m.commander.GetProcessor().CancelProcessing()
 				m.loadingState.IsLoading = false
 				m.mainOutput = "Operation cancelled."
 				return m, nil
 			}
-			// If we’re already prompting to exit, this time we really quit:
+			// If we’re already prompting exit, quit
 			if m.exitPrompt {
 				return m, tea.Quit
 			}
+			// If in viz mode, exit
 			if m.uiMode == ModeViz {
 				m.uiMode = ModeFull
 				return m, nil
 			}
-			// If track loaded, user might want to unload on ctrl+c. Or simply prompt to exit:
+			// If track loaded => unload
 			if m.commander.IsInTrackMode() {
-				output, err, cmd := m.commander.Execute("unload")
+				out, err, cmd := m.commander.Execute("unload")
 				if err != nil {
 					m.mainOutput = fmt.Sprintf("Error: %v", err)
 				} else {
-					m.mainOutput = output
+					m.mainOutput = out
 				}
 				if cmd != nil {
 					cmds = append(cmds, cmd)
 				}
 				return m, tea.Batch(cmds...)
 			}
-			// Normal “prompt to exit”:
+			// Otherwise, prompt exit
 			m.exitPrompt = true
 			m.mainOutput = "Press Ctrl+C again to exit or any other key to continue..."
 			return m, nil
 
 		case tea.KeyUp:
 			if msg.Alt {
-				// Example: alt+↑ => volume-up
-				output, err, cmd := m.commander.Execute("volume-up")
+				out, err, cmd := m.commander.Execute("volume-up")
 				if err != nil {
 					m.mainOutput = fmt.Sprintf("Error: %v", err)
-				} else if output != "" {
-					m.mainOutput = output
+				} else if out != "" {
+					m.mainOutput = out
 				}
 				if cmd != nil {
 					cmds = append(cmds, cmd)
 				}
 			} else {
-				// Command history up
 				if m.historyPos < len(m.history)-1 {
 					m.historyPos++
-					m.input.SetValue(m.history[len(m.history)-1-m.historyPos])
+					m.setInputValue(m.history[len(m.history)-1-m.historyPos])
 				}
 			}
 
 		case tea.KeyDown:
 			if msg.Alt {
-				// Example: alt+↓ => volume-down
-				output, err, cmd := m.commander.Execute("volume-down")
+				out, err, cmd := m.commander.Execute("volume-down")
 				if err != nil {
 					m.mainOutput = fmt.Sprintf("Error: %v", err)
-				} else if output != "" {
-					m.mainOutput = output
+				} else if out != "" {
+					m.mainOutput = out
 				}
 				if cmd != nil {
 					cmds = append(cmds, cmd)
 				}
 			} else {
-				// Command history down
 				if m.historyPos > 0 {
 					m.historyPos--
-					m.input.SetValue(m.history[len(m.history)-1-m.historyPos])
+					m.setInputValue(m.history[len(m.history)-1-m.historyPos])
 				} else if m.historyPos == 0 {
 					m.historyPos = -1
-					m.input.SetValue("")
+					m.setInputValue("")
 				}
 			}
 
 		case tea.KeyCtrlR:
-			// Example: open a “search in history” mode (not fully implemented)
 			if !m.searchMode {
 				m.searchMode = true
 				m.searchQuery = ""
-				m.input.SetValue("")
-				m.input.Placeholder = "Search history..."
+				m.setInputValue("")
+				m.setInputPlaceholder("Search history...")
 			}
 
 		case tea.KeyTab:
-			// Tab completion (only if not in “search mode”):
-			if m.searchMode {
-				return m, nil
+			if !m.searchMode {
+				m.handleTabCompletion()
 			}
-			m.handleTabCompletion()
 
 		case tea.KeyEnter:
 			m.exitPrompt = false
 			m.mainOutput = strings.TrimSuffix(m.mainOutput, m.tabOutput)
-			command := m.input.Value()
-
-			if command != "" {
-				// Search-mode logic:
+			cmdStr := m.getInputValue()
+			if cmdStr != "" {
 				if m.searchMode {
 					m.searchMode = false
-					m.input.Placeholder = "Enter command (type 'help' for list)"
+					m.setInputPlaceholder("Enter command (type 'help' for list)")
 					for i := len(m.history) - 1; i >= 0; i-- {
-						if strings.Contains(m.history[i], command) {
-							m.input.SetValue(m.history[i])
+						if strings.Contains(m.history[i], cmdStr) {
+							m.setInputValue(m.history[i])
 							break
 						}
 					}
 				} else {
-					// Normal command execution:
 					if m.uiMode == ModeViz {
-						// Let user type “q” or “help” from within Viz mode:
-						switch command {
+						switch cmdStr {
 						case "q", "quit", "exit":
 							m.uiMode = ModeFull
-							m.input.SetValue("")
+							m.setInputValue("")
 							return m, nil
 						case "help", "h", "?":
 							m.mainOutput = m.showVisualizationShortcuts()
-							m.input.SetValue("")
+							m.setInputValue("")
 							return m, nil
 						}
 					}
 
-					// If user typed an HTTP/HTTPS address => example streaming
-					if strings.HasPrefix(command, "http://") || strings.HasPrefix(command, "https://") {
-						return m, m.handleStreamStart(command)
+					if strings.HasPrefix(cmdStr, "http://") || strings.HasPrefix(cmdStr, "https://") {
+						return m, m.handleStreamStart(cmdStr)
 					}
 
-					output, err, cmd := m.commander.Execute(command)
-
-					// If “analysis in progress” or “not complete,” do NOT override spinner with an error:
+					out, err, c2 := m.commander.Execute(cmdStr)
 					if err != nil {
-						errStr := err.Error()
-						if strings.Contains(errStr, "analysis in progress") ||
-							strings.Contains(errStr, "analysis not complete") {
-							// skip error display; spinner will continue
-						} else {
-							m.mainOutput = fmt.Sprintf("Error: %v", err)
+						if !strings.Contains(err.Error(), "analysis in progress") &&
+							!strings.Contains(err.Error(), "analysis not complete") {
+							m.mainOutput = "Error: " + err.Error()
 						}
 					} else {
-						m.mainOutput = output
-						// If user typed “viz wave” or just “viz spectrum,” we may switch to Viz mode:
-						if strings.HasPrefix(command, "viz ") || command == "viz" {
+						m.mainOutput = out
+						if strings.HasPrefix(cmdStr, "viz ") || cmdStr == "viz" {
 							m.uiMode = ModeViz
 						}
 					}
-					if cmd != nil {
-						cmds = append(cmds, cmd)
+					if c2 != nil {
+						cmds = append(cmds, c2)
 					}
-
-					m.history = append(m.history, command)
+					m.history = append(m.history, cmdStr)
 					m.historyPos = -1
 					m.clearTabCompletion()
-					m.input.SetValue("")
+					m.setInputValue("")
 				}
 			}
 
 		case tea.KeyRunes:
-			// “?” => show shortcuts
 			if msg.Runes[0] == '?' {
 				if m.uiMode == ModeViz {
 					m.mainOutput = m.showVisualizationShortcuts()
@@ -254,8 +253,8 @@ func (m AudioModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyEsc:
 			if m.searchMode {
 				m.searchMode = false
-				m.input.Placeholder = "Enter command (type 'help' for list)"
-				m.input.SetValue("")
+				m.setInputPlaceholder("Enter command (type 'help' for list)")
+				m.setInputValue("")
 			}
 			if m.uiMode == ModeViz {
 				m.uiMode = ModeFull
@@ -265,41 +264,39 @@ func (m AudioModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.exitPrompt = false
 
 		case tea.KeyBackspace:
-			if len(m.input.Value()) == 0 {
+			if len(m.getInputValue()) == 0 {
 				m.clearTabCompletion()
 			}
-
 		default:
-			// Check if it’s a recognized “shortcut” we mapped (ctrl+p, etc.):
-			output, err, shortcutCmd := m.handleShortcut(msg.String())
+			out, err, c2 := m.handleShortcut(msg.String())
 			if err != nil {
 				m.mainOutput = fmt.Sprintf("Error: %v", err)
-			} else if output != "" {
-				m.mainOutput = output
+			} else if out != "" {
+				m.mainOutput = out
 			}
-			if shortcutCmd != nil {
-				cmds = append(cmds, shortcutCmd)
+			if c2 != nil {
+				cmds = append(cmds, c2)
 			}
 			m.exitPrompt = false
 			if m.searchMode {
-				m.searchQuery = m.input.Value()
+				m.searchQuery = m.getInputValue()
 			}
 		}
 
 	//----------------------------------------------------------------------
-	// Spinner (we always keep it ticking if needed)
+	// spinner.TickMsg: maintain spinner if loading
 	//----------------------------------------------------------------------
 	case spinner.TickMsg:
-		// Only update spinner if we're actually loading
 		if m.loadingState.IsLoading {
-			var cmd tea.Cmd
-			newSpinner, cmd := m.spinner.Update(msg)
-			m.spinner = newSpinner
-			return m, cmd
+			var _ tea.Cmd
+			newSpin, c2 := m.spinner.Update(msg)
+			m.spinner = newSpin
+			cmds = append(cmds, c2)
+			return m, tea.Batch(cmds...)
 		}
 
 	//----------------------------------------------------------------------
-	// Resize events
+	// Window resizing
 	//----------------------------------------------------------------------
 	case tea.WindowSizeMsg:
 		if !m.ready {
@@ -312,60 +309,65 @@ func (m AudioModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Height = msg.Height - 3
 		m.progress.Width = msg.Width - 20
 
-		// If in Viz mode, pass resize to processor’s visualization manager
+		// If not loading, re-render metadata if present
+		if !m.loadingState.IsLoading {
+			if meta := m.commander.GetProcessor().GetMetadata(); meta != nil {
+				m.mainOutput = m.BuildMetadataOutput(meta)
+			}
+		}
+
 		if m.uiMode == ModeViz && m.commander.IsInTrackMode() {
 			resizeStr := fmt.Sprintf("resize:%dx%d", msg.Width, msg.Height-6)
 			m.commander.GetProcessor().HandleVisualizationInput(resizeStr)
 		}
 	}
 
-	if m.commander != nil && m.commander.GetProcessor() != nil {
-		pStatus := m.commander.GetProcessor().GetStatus()
-		switch pStatus.State {
+	// Check Processor status
+	if p := m.commander.GetProcessor(); p != nil {
+		st := p.GetStatus()
+		switch st.State {
 		case audio.StateIdle:
 			if m.loadingState.IsLoading {
-				// Just finished loading - clear loading state and show metadata
 				m.loadingState.IsLoading = false
 				m.loadingState.Message = ""
 				m.loadingState.Progress = 0
 				m.loadingState.CanCancel = false
 
-				// Get and display metadata
-				if meta := m.commander.GetProcessor().GetMetadata(); meta != nil {
-					m.mainOutput = meta.String()
+				// Show partial after load
+				m.showFullInfo = false
+				if meta := p.GetMetadata(); meta != nil {
+					m.mainOutput = m.BuildMetadataOutput(meta)
 				}
 			}
+
 		case audio.StateLoading:
 			m.loadingState.IsLoading = true
-			m.loadingState.Message = pStatus.Message
-			m.loadingState.Progress = pStatus.Progress
-			m.loadingState.StartTime = pStatus.StartTime
-			m.loadingState.BytesLoaded = pStatus.BytesLoaded
-			m.loadingState.FileSize = pStatus.TotalBytes
-			m.loadingState.CanCancel = pStatus.CanCancel
+			m.loadingState.Message = st.Message
+			m.loadingState.Progress = st.Progress
+			m.loadingState.StartTime = st.StartTime
+			m.loadingState.BytesLoaded = st.BytesLoaded
+			m.loadingState.FileSize = st.TotalBytes
+			m.loadingState.CanCancel = st.CanCancel
 		}
+		m.syncLoadingStateFromProcessor(st)
 	}
 
-	// Periodically check the Processor status => update loadingState => TUI can show spinner/progress
-	pStatus := m.commander.GetProcessor().GetStatus()
-	m.syncLoadingStateFromProcessor(pStatus)
-
-	// Update the input field
+	// Update input
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	cmds = append(cmds, cmd)
 
-	// If ready, update the viewport
+	// Update viewport
 	if m.ready {
-		newViewport, viewportCmd := m.viewport.Update(msg)
-		m.viewport = newViewport
-		cmds = append(cmds, viewportCmd)
+		newVP, cmd2 := m.viewport.Update(msg)
+		m.viewport = newVP
+		cmds = append(cmds, cmd2)
 	}
 
 	return m, tea.Batch(cmds...)
 }
 
-// syncLoadingStateFromProcessor updates our TUI loadingState from the Processor’s status
+// syncLoadingStateFromProcessor updates progress or message from processor status.
 func (m *AudioModel) syncLoadingStateFromProcessor(st audio.ProcessingStatus) {
 	switch st.State {
 	case audio.StateIdle:
@@ -381,12 +383,9 @@ func (m *AudioModel) syncLoadingStateFromProcessor(st audio.ProcessingStatus) {
 		m.loadingState.CanCancel = st.CanCancel
 		m.loadingState.Message = st.Message
 		m.loadingState.StartTime = st.StartTime
-
-		// Only update progress if we have valid data
 		if st.TotalBytes > 0 {
 			m.loadingState.UpdateProgress(st.BytesLoaded, st.TotalBytes)
 		} else {
-			// Reset progress tracking for unknown size files
 			m.loadingState.BytesLoaded = st.BytesLoaded
 			m.loadingState.FileSize = 0
 			m.loadingState.Progress = 0
@@ -398,37 +397,19 @@ func (m *AudioModel) syncLoadingStateFromProcessor(st audio.ProcessingStatus) {
 		m.loadingState.Message = st.Message
 		m.loadingState.StartTime = st.StartTime
 		m.loadingState.Progress = st.Progress
-		// Reset byte tracking during analysis
 		m.loadingState.BytesLoaded = 0
 		m.loadingState.FileSize = 0
 	}
 }
 
-func (m AudioModel) updateStreamProgress(msg streamMsg) (AudioModel, tea.Cmd) {
-	if msg.error != nil {
-		// Streaming error
-		m.loadingState.IsLoading = false
-		m.mainOutput = fmt.Sprintf("Streaming error: %v", msg.error)
-		return m, nil
-	}
+func (m *AudioModel) setInputValue(val string) {
+	m.input.SetValue(val)
+}
 
-	m.loadingState.IsLoading = true
-	m.loadingState.Message = fmt.Sprintf("Streaming from %s... %.0f%%", msg.url, msg.progress*100)
-	m.loadingState.Progress = msg.progress
+func (m *AudioModel) setInputPlaceholder(ph string) {
+	m.input.Placeholder = ph
+}
 
-	if msg.progress >= 1.0 {
-		// Done streaming
-		m.loadingState.IsLoading = false
-		m.mainOutput = "Streaming completed."
-		return m, nil
-	}
-
-	// Otherwise, continue incrementing progress
-	return m, tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
-		nextProg := msg.progress + 0.1
-		if nextProg > 1.0 {
-			nextProg = 1.0
-		}
-		return streamMsg{url: msg.url, progress: nextProg}
-	})
+func (m *AudioModel) getInputValue() string {
+	return m.input.Value()
 }

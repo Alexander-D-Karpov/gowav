@@ -5,30 +5,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 )
 
-func getStringTag(tags map[string]interface{}, key string) string {
-	if val, ok := tags[key]; ok {
-		switch v := val.(type) {
-		case string:
-			return v
-		case []string:
-			if len(v) > 0 {
-				return v[0]
-			}
-		case []interface{}:
-			if len(v) > 0 {
-				if str, ok := v[0].(string); ok {
-					return str
-				}
-			}
-		}
-	}
-	return ""
-}
-
 func (p *Processor) loadFromFile(path string, cancelChan chan struct{}) ([]byte, error) {
+	startTime := time.Now()
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open error: %w", err)
@@ -40,10 +22,23 @@ func (p *Processor) loadFromFile(path string, cancelChan chan struct{}) ([]byte,
 		return nil, fmt.Errorf("stat error: %w", err)
 	}
 
+	// If file is empty, just read it all at once.
+	if info.Size() == 0 {
+		data, err := io.ReadAll(file)
+		if err != nil {
+			return nil, fmt.Errorf("read error (empty file): %w", err)
+		}
+		return data, nil
+	}
+
 	data := make([]byte, 0, info.Size())
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, 64*1024)
 	var totalRead int64
 	readStart := time.Now()
+	var lastUpdate time.Time
+
+	// We'll only show a real ETA after at least 512 KB read.
+	const minBytesForETA = 512 * 1024
 
 	for {
 		select {
@@ -56,26 +51,46 @@ func (p *Processor) loadFromFile(path string, cancelChan chan struct{}) ([]byte,
 		if n > 0 {
 			data = append(data, buf[:n]...)
 			totalRead += int64(n)
+		}
 
-			// Update progress with ETA
-			elapsed := time.Since(readStart)
-			if elapsed > 0 {
-				bytesPerSec := float64(totalRead) / elapsed.Seconds()
-				remainingBytes := info.Size() - totalRead
-				eta := time.Duration(float64(remainingBytes)/bytesPerSec) * time.Second
+		now := time.Now()
+		// Update UI every 100ms or upon EOF
+		if now.Sub(lastUpdate) > 100*time.Millisecond || (err == io.EOF && n > 0) {
+			elapsed := now.Sub(readStart)
 
-				p.mu.Lock()
-				p.status = ProcessingStatus{
-					State:       StateLoading,
-					Message:     fmt.Sprintf("Loading file... (ETA: %s)", formatETA(eta)),
-					Progress:    float64(totalRead) / float64(info.Size()),
-					CanCancel:   true,
-					StartTime:   readStart,
-					BytesLoaded: totalRead,
-					TotalBytes:  info.Size(),
+			var progress float64
+			if info.Size() > 0 {
+				progress = float64(totalRead) / float64(info.Size())
+				if progress > 1 {
+					progress = 1
 				}
-				p.mu.Unlock()
 			}
+
+			var etaStr = "calculating..."
+			if elapsed > 0 && totalRead > minBytesForETA {
+				bytesPerSec := float64(totalRead) / elapsed.Seconds()
+				remaining := float64(info.Size()-totalRead) / bytesPerSec
+				if remaining < 0 {
+					remaining = 0
+				}
+				etaStr = formatETA(time.Duration(remaining) * time.Second)
+			}
+
+			p.mu.Lock()
+			p.status = ProcessingStatus{
+				State:       StateLoading,
+				Message:     fmt.Sprintf("Loading file... (ETA: %s)", etaStr),
+				Progress:    progress,
+				CanCancel:   true,
+				StartTime:   readStart,
+				BytesLoaded: totalRead,
+				TotalBytes:  info.Size(),
+			}
+			p.mu.Unlock()
+
+			lastUpdate = now
+			// Allow the TUI to process this status update
+			runtime.Gosched()
 		}
 
 		if err == io.EOF {
@@ -86,10 +101,13 @@ func (p *Processor) loadFromFile(path string, cancelChan chan struct{}) ([]byte,
 		}
 	}
 
+	totalLoadTime := time.Since(startTime)
+	logDebug("File %s loaded in %v (size=%d bytes)", path, totalLoadTime, totalRead)
 	return data, nil
 }
 
 func (p *Processor) loadFromURL(url string, cancelChan chan struct{}) ([]byte, error) {
+	startTime := time.Now()
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
@@ -109,10 +127,14 @@ func (p *Processor) loadFromURL(url string, cancelChan chan struct{}) ([]byte, e
 		return nil, fmt.Errorf("server returned %d", resp.StatusCode)
 	}
 
-	data := make([]byte, 0)
-	buf := make([]byte, 32*1024)
+	contentLength := resp.ContentLength
+	data := make([]byte, 0, 32*1024)
+	buf := make([]byte, 64*1024)
 	var totalRead int64
 	readStart := time.Now()
+	var lastUpdate time.Time
+
+	const minBytesForETA = 512 * 1024
 
 	for {
 		select {
@@ -125,28 +147,44 @@ func (p *Processor) loadFromURL(url string, cancelChan chan struct{}) ([]byte, e
 		if n > 0 {
 			data = append(data, buf[:n]...)
 			totalRead += int64(n)
+		}
 
-			// Update progress if content length is known
-			if resp.ContentLength > 0 {
-				elapsed := time.Since(readStart)
-				if elapsed > 0 {
-					bytesPerSec := float64(totalRead) / elapsed.Seconds()
-					remainingBytes := resp.ContentLength - totalRead
-					eta := time.Duration(float64(remainingBytes)/bytesPerSec) * time.Second
+		now := time.Now()
+		if now.Sub(lastUpdate) > 100*time.Millisecond || (err == io.EOF && n > 0) {
+			var progress float64
+			var etaStr = "calculating..."
+			elapsed := now.Sub(readStart)
 
-					p.mu.Lock()
-					p.status = ProcessingStatus{
-						State:       StateLoading,
-						Message:     fmt.Sprintf("Downloading... (ETA: %s)", formatETA(eta)),
-						Progress:    float64(totalRead) / float64(resp.ContentLength),
-						CanCancel:   true,
-						StartTime:   readStart,
-						BytesLoaded: totalRead,
-						TotalBytes:  resp.ContentLength,
-					}
-					p.mu.Unlock()
+			if contentLength > 0 {
+				progress = float64(totalRead) / float64(contentLength)
+				if progress > 1 {
+					progress = 1
 				}
 			}
+
+			if elapsed > 0 && totalRead > minBytesForETA {
+				bytesPerSec := float64(totalRead) / elapsed.Seconds()
+				remaining := float64(contentLength-totalRead) / bytesPerSec
+				if remaining < 0 {
+					remaining = 0
+				}
+				etaStr = formatETA(time.Duration(remaining) * time.Second)
+			}
+
+			p.mu.Lock()
+			p.status = ProcessingStatus{
+				State:       StateLoading,
+				Message:     fmt.Sprintf("Downloading... (ETA: %s)", etaStr),
+				Progress:    progress,
+				CanCancel:   true,
+				StartTime:   readStart,
+				BytesLoaded: totalRead,
+				TotalBytes:  contentLength,
+			}
+			p.mu.Unlock()
+
+			lastUpdate = now
+			runtime.Gosched()
 		}
 
 		if err == io.EOF {
@@ -157,6 +195,8 @@ func (p *Processor) loadFromURL(url string, cancelChan chan struct{}) ([]byte, e
 		}
 	}
 
+	totalLoadTime := time.Since(startTime)
+	logDebug("URL %s downloaded in %v (size=%d bytes)", url, totalLoadTime, totalRead)
 	return data, nil
 }
 
@@ -166,5 +206,9 @@ func formatETA(d time.Duration) string {
 	} else if d > 1*time.Minute {
 		return fmt.Sprintf("%.1f minutes", d.Minutes())
 	}
-	return fmt.Sprintf("%.0f seconds", d.Seconds())
+	if d < 0 {
+		d = 0
+	}
+	sec := d.Seconds()
+	return fmt.Sprintf("%.0f seconds", sec)
 }

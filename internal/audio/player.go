@@ -80,12 +80,10 @@ func (p *Player) Pause() error {
 	}
 
 	p.updatePosition()
-
 	if p.player != nil {
 		p.player.Close()
 		p.player = nil
 	}
-
 	p.state = StatePaused
 	return nil
 }
@@ -98,7 +96,6 @@ func (p *Player) Stop() error {
 		p.player.Close()
 		p.player = nil
 	}
-
 	p.buffer = nil
 	p.state = StateStopped
 	p.position = 0
@@ -154,7 +151,7 @@ func (p *Player) RenderTrackBar(width int) string {
 		progress = 1.0
 	}
 
-	barWidth := width - 20 // Leave space for time display
+	barWidth := width - 20
 	if barWidth < 1 {
 		barWidth = 1
 	}
@@ -182,4 +179,10 @@ func (p *Player) RenderTrackBar(width int) string {
 	bar.WriteString(fmt.Sprintf("] %s/%s", posStr, durStr))
 
 	return bar.String()
+}
+
+func (p *Player) RefreshPosition() {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	p.updatePosition()
 }

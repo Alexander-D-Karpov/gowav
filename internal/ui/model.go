@@ -1,9 +1,12 @@
 package ui
 
 import (
+	"fmt"
+	"gowav/internal/audio"
 	"gowav/internal/commands"
 	"gowav/internal/types"
 	"gowav/pkg/viz"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
@@ -32,16 +35,16 @@ const (
 	ModeViz
 )
 
-// Model is the main Bubble Tea model for our TUI.
+// AudioModel is the main Bubble Tea model for our TUI.
 type AudioModel struct {
 	// Input and main display
 	input    textinput.Model
 	viewport viewport.Model
 
-	// Commander for executing all user commands
+	// Commander for executing user commands
 	commander *commands.Commander
 
-	// Progress/spinner for loading/analysis
+	// Progress/spinner for loading or analysis
 	progress progress.Model
 	spinner  spinner.Model
 
@@ -63,16 +66,16 @@ type AudioModel struct {
 	exitPrompt  bool
 	uiMode      UIMode
 	searchMode  bool
-	searchQuery string // used if we want to store the typed query
+	searchQuery string // used if we want to store typed query
 
 	// Visualization
 	vizEnabled     bool
 	currentVizMode viz.ViewMode
 
-	// Timestamp for measuring intervals if needed
+	// Timestamp for intervals if needed
 	lastUpdateTime time.Time
 
-	// Loading/analysis state with progress
+	// Loading/analysis state
 	loadingState *types.LoadingState
 
 	// Tab-completion
@@ -80,11 +83,14 @@ type AudioModel struct {
 
 	// Keyboard shortcuts map
 	shortcuts map[string]string
+
+	// Whether to show the "full info" (raw tags, no artwork) vs. partial
+	showFullInfo bool
 }
 
 // NewModel creates a new TUI model with defaults.
 func NewModel() AudioModel {
-	// Text input field
+	// Text input
 	input := textinput.New()
 	input.Placeholder = "Enter command (type 'help' for list)"
 	input.Focus()
@@ -145,10 +151,65 @@ func NewModel() AudioModel {
 	}
 }
 
-// Init is part of the Bubble Tea interface. It can return a command to run upon start.
+// Init returns any initial commands to run.
 func (m AudioModel) Init() tea.Cmd {
 	return tea.Batch(
 		textinput.Blink,
 		spinner.Tick,
 	)
+}
+
+// BuildMetadataOutput chooses partial or full table based on m.showFullInfo.
+// If full, we show raw tags (no artwork). If partial, we show artwork if there's space.
+func (m *AudioModel) BuildMetadataOutput(meta *audio.Metadata) string {
+	if m.showFullInfo {
+		// Full table with raw tags, no artwork
+		out := meta.AdaptiveStringWithRaw(m.width, m.height)
+		out += m.buildPlaybackStatus()
+		return out
+	} else {
+		// Partial table with optional side-by-side artwork
+		out := meta.BuildLoadInfo(m.width, m.height)
+		out += m.buildPlaybackStatus()
+		return out
+	}
+}
+
+// buildPlaybackStatus appends current playback info from the Commander’s player.
+func (m *AudioModel) buildPlaybackStatus() string {
+	player := m.commander.GetPlayer()
+	if player == nil {
+		return ""
+	}
+	state := player.GetState()
+	position := player.GetPosition()
+	duration := player.GetDuration()
+
+	var sb strings.Builder
+	sb.WriteString("\n\nPlayback Status:\n")
+	sb.WriteString(fmt.Sprintf("State: %s\n", formatPlaybackState(state)))
+	sb.WriteString(fmt.Sprintf("Position: %s\n", localFormatDuration(position)))
+	sb.WriteString(fmt.Sprintf("Duration: %s\n", localFormatDuration(duration)))
+	sb.WriteString("\n" + player.RenderTrackBar(60))
+	return sb.String()
+}
+
+// formatPlaybackState is a small helper for showing playback state text.
+func formatPlaybackState(st audio.PlaybackState) string {
+	switch st {
+	case audio.StatePlaying:
+		return "Playing"
+	case audio.StatePaused:
+		return "Paused"
+	default:
+		return "Stopped"
+	}
+}
+
+// localFormatDuration shows mm:ss
+func localFormatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	min := int(d.Minutes())
+	sec := int(d.Seconds()) % 60
+	return fmt.Sprintf("%02d:%02d", min, sec)
 }

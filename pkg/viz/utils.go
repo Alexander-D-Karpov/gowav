@@ -9,6 +9,9 @@ import (
 
 // Time utilities
 func formatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
 	d = d.Round(time.Second)
 	min := int(d.Minutes())
 	sec := int(d.Seconds()) % 60

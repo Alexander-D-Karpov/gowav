@@ -40,7 +40,6 @@ func logDebug(format string, args ...interface{}) {
 	if err := initLogging(); err != nil {
 		return
 	}
-
 	timestamp := time.Now().Format("15:04:05.000")
 	msg := fmt.Sprintf(format, args...)
 	fmt.Fprintf(logFile, "[%s] %s\n", timestamp, msg)

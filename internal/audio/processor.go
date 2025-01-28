@@ -1,5 +1,3 @@
-// internal/audio/processor.go
-
 package audio
 
 import (
@@ -112,20 +110,16 @@ func (p *Processor) LoadFile(path string) error {
 }
 
 func (p *Processor) SwitchVisualization(mode viz.ViewMode) (string, error) {
-	// First check if we can switch
 	p.mu.RLock()
 	if p.status.State == StateAnalyzing {
 		msg := p.status.Message
 		p.mu.RUnlock()
 		return "", fmt.Errorf("analysis in progress: %s", msg)
 	}
-
 	if len(p.currentFile) == 0 {
 		p.mu.RUnlock()
 		return "", fmt.Errorf("no audio data available")
 	}
-
-	// If already analyzed, just switch
 	if p.vizCache[mode] {
 		err := p.vizManager.SetMode(mode)
 		p.mu.RUnlock()
@@ -136,21 +130,19 @@ func (p *Processor) SwitchVisualization(mode viz.ViewMode) (string, error) {
 	}
 	p.mu.RUnlock()
 
-	// Start analysis in a separate goroutine
 	resultChan := make(chan error, 1)
 	go func() {
 		err := p.analyzeAndCreateVisualization(mode)
 		resultChan <- err
 	}()
 
-	// Wait for initial analysis to start
 	select {
 	case err := <-resultChan:
 		if err != nil {
 			return "", fmt.Errorf("failed to start analysis: %v", err)
 		}
 	case <-time.After(100 * time.Millisecond):
-		// Analysis started successfully
+		// Analysis started
 	}
 
 	return fmt.Sprintf("Preparing %s visualization...", getModeName(mode)), nil
@@ -158,13 +150,11 @@ func (p *Processor) SwitchVisualization(mode viz.ViewMode) (string, error) {
 
 func (p *Processor) analyzeAndCreateVisualization(mode viz.ViewMode) error {
 	p.mu.Lock()
-	// Create new audio model if needed
 	if p.audioModel == nil {
 		p.audioModel = NewModel(p.metadata.SampleRate)
 		logDebug("Created new audio model with sample rate: %d", p.metadata.SampleRate)
 	}
 
-	// Update status
 	p.status = ProcessingStatus{
 		State:     StateAnalyzing,
 		Message:   fmt.Sprintf("Preparing %s visualization...", getModeName(mode)),
@@ -172,238 +162,236 @@ func (p *Processor) analyzeAndCreateVisualization(mode viz.ViewMode) error {
 		CanCancel: true,
 		StartTime: time.Now(),
 	}
+	currentFile := p.currentFile
+	cancelChan := p.analysisCancel
 	p.mu.Unlock()
 
-	// Do the analysis outside the lock
-	err := p.initializeAnalysis(mode)
-	if err != nil {
-		p.setError(fmt.Sprintf("Analysis failed: %v", err))
+	errChan := make(chan error, 3)
+	doneChan := make(chan struct{})
+	var wg sync.WaitGroup
+	cleanupOnce := sync.Once{}
+
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			select {
+			case <-errChan:
+			default:
+				close(errChan)
+			}
+			select {
+			case <-doneChan:
+			default:
+				close(doneChan)
+			}
+		})
+	}
+	defer cleanup()
+
+	runAnalysisStage := func(name string, fn func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			err := fn()
+			if err != nil {
+				select {
+				case errChan <- fmt.Errorf("%s failed: %w", name, err):
+				default:
+				}
+				return
+			}
+			logDebug("%s completed in %v", name, time.Since(start))
+		}()
+	}
+
+	// Choose analysis steps
+	switch mode {
+	case viz.WaveformMode:
+		if len(p.audioModel.RawData) == 0 {
+			runAnalysisStage("waveform", func() error {
+				return p.audioModel.AnalyzeWaveform(
+					currentFile,
+					func(progress float64) {
+						p.updateAnalysisProgress(progress, "Analyzing waveform...")
+					},
+					cancelChan,
+				)
+			})
+		}
+
+	case viz.SpectrogramMode:
+		if len(p.audioModel.RawData) == 0 {
+			runAnalysisStage("waveform", func() error {
+				return p.audioModel.AnalyzeWaveform(
+					currentFile,
+					func(progress float64) {
+						p.updateAnalysisProgress(progress*0.4, "Analyzing waveform...")
+					},
+					cancelChan,
+				)
+			})
+		}
+		if p.audioModel.FFTData == nil {
+			runAnalysisStage("spectrum", func() error {
+				return p.audioModel.AnalyzeSpectrum(
+					func(progress float64) {
+						p.updateAnalysisProgress(0.4+progress*0.6, "Computing frequency analysis...")
+					},
+					cancelChan,
+				)
+			})
+		}
+
+	case viz.TempoMode:
+		if len(p.audioModel.RawData) == 0 {
+			runAnalysisStage("waveform", func() error {
+				return p.audioModel.AnalyzeWaveform(
+					currentFile,
+					func(progress float64) {
+						p.updateAnalysisProgress(progress*0.3, "Analyzing waveform...")
+					},
+					cancelChan,
+				)
+			})
+		}
+		if p.audioModel.FFTData == nil {
+			runAnalysisStage("spectrum", func() error {
+				return p.audioModel.AnalyzeSpectrum(
+					func(progress float64) {
+						p.updateAnalysisProgress(0.3+progress*0.3, "Computing frequency analysis...")
+					},
+					cancelChan,
+				)
+			})
+		}
+		if len(p.audioModel.BeatData) == 0 {
+			runAnalysisStage("beats", func() error {
+				return p.audioModel.AnalyzeBeats(
+					func(progress float64) {
+						p.updateAnalysisProgress(0.6+progress*0.4, "Detecting beats...")
+					},
+					cancelChan,
+				)
+			})
+		}
+
+	case viz.BeatMapMode:
+		if len(p.audioModel.RawData) == 0 {
+			runAnalysisStage("waveform", func() error {
+				return p.audioModel.AnalyzeWaveform(
+					currentFile,
+					func(progress float64) {
+						p.updateAnalysisProgress(progress*0.3, "Analyzing waveform...")
+					},
+					cancelChan,
+				)
+			})
+		}
+		if p.audioModel.FFTData == nil {
+			runAnalysisStage("spectrum", func() error {
+				return p.audioModel.AnalyzeSpectrum(
+					func(progress float64) {
+						p.updateAnalysisProgress(0.3+progress*0.3, "Computing frequency analysis...")
+					},
+					cancelChan,
+				)
+			})
+		}
+		if len(p.audioModel.BeatData) == 0 {
+			runAnalysisStage("beats", func() error {
+				return p.audioModel.AnalyzeBeats(
+					func(progress float64) {
+						p.updateAnalysisProgress(0.6+progress*0.4, "Detecting beats...")
+					},
+					cancelChan,
+				)
+			})
+		}
+
+	case viz.DensityMode:
+		if len(p.audioModel.RawData) == 0 {
+			runAnalysisStage("waveform", func() error {
+				return p.audioModel.AnalyzeWaveform(
+					currentFile,
+					func(progress float64) {
+						p.updateAnalysisProgress(progress, "Analyzing waveform...")
+					},
+					cancelChan,
+				)
+			})
+		}
+
+	default:
+		return fmt.Errorf("unsupported visualization mode: %v", mode)
+	}
+
+	// Wait for completion or error
+	completed := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(completed)
+	}()
+
+	select {
+	case err := <-errChan:
 		return err
+	case <-completed:
+	case <-cancelChan:
+		return fmt.Errorf("analysis cancelled")
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Create visualization
+	// Correct actual duration from samples if needed
+	actualDuration := time.Duration(float64(len(p.audioModel.RawData)) / float64(p.audioModel.SampleRate) * float64(time.Second))
+	if actualDuration > p.metadata.Duration {
+		logDebug("Actual duration (%v) differs from metadata (%v), using actual", actualDuration, p.metadata.Duration)
+		p.metadata.Duration = actualDuration
+	}
+
 	var v viz.Visualization
 	switch mode {
 	case viz.WaveformMode:
-		if len(p.audioModel.RawData) == 0 {
-			return fmt.Errorf("waveform analysis incomplete")
-		}
 		v = viz.CreateWaveformViz(p.audioModel.RawData, p.audioModel.SampleRate)
-
 	case viz.SpectrogramMode:
-		if p.audioModel.FFTData == nil || len(p.audioModel.FFTData) == 0 {
-			return fmt.Errorf("spectrum analysis incomplete")
-		}
-		v = viz.NewSpectrogramViz(
-			p.audioModel.FFTData,
-			p.audioModel.FreqBands,
-			p.audioModel.SampleRate,
-		)
-
+		v = viz.NewSpectrogramViz(p.audioModel.FFTData, p.audioModel.FreqBands, p.audioModel.SampleRate)
 	case viz.TempoMode:
-		if len(p.audioModel.BeatData) == 0 {
-			return fmt.Errorf("tempo analysis incomplete")
-		}
-		v = viz.NewTempoViz(
-			p.audioModel.BeatData,
-			p.audioModel.RawData,
-			p.audioModel.SampleRate,
-		)
-
+		v = viz.NewTempoViz(p.audioModel.BeatData, p.audioModel.RawData, p.audioModel.SampleRate)
 	case viz.BeatMapMode:
-		if len(p.audioModel.BeatOnsets) == 0 {
-			return fmt.Errorf("beat analysis incomplete")
-		}
-		v = viz.NewBeatViz(
-			p.audioModel.BeatData,
-			p.audioModel.BeatOnsets,
-			p.audioModel.EstimatedTempo,
-			p.audioModel.SampleRate,
-		)
+		v = viz.NewBeatViz(p.audioModel.BeatData, p.audioModel.BeatOnsets, p.audioModel.EstimatedTempo, p.audioModel.SampleRate)
+	case viz.DensityMode:
+		v = viz.NewDensityViz(p.audioModel.RawData, p.audioModel.SampleRate)
 	}
 
 	if v == nil {
 		return fmt.Errorf("failed to create visualization")
 	}
 
+	// Set total duration in Visualization
+	p.vizManager.SetTotalDuration(p.metadata.Duration)
 	v.SetTotalDuration(p.metadata.Duration)
+
+	// Add and switch to mode
 	p.vizManager.AddVisualization(mode, v)
 	p.vizCache[mode] = true
 
-	err = p.vizManager.SetMode(mode)
-	if err != nil {
+	if err := p.vizManager.SetMode(mode); err != nil {
 		return fmt.Errorf("failed to set visualization mode: %v", err)
 	}
 
+	// Done
 	p.status = ProcessingStatus{
 		State:    StateIdle,
 		Message:  fmt.Sprintf("%s visualization ready", getModeName(mode)),
 		Progress: 1.0,
 	}
 
+	logDebug("Created %s visualization with duration %v", getModeName(mode), p.metadata.Duration)
 	return nil
 }
 
-func (p *Processor) initializeAnalysis(mode viz.ViewMode) error {
-	// Check what analysis we need
-	p.mu.Lock()
-	if p.audioModel == nil {
-		p.audioModel = NewModel(p.metadata.SampleRate)
-		logDebug("Created new audio model with sample rate: %d", p.metadata.SampleRate)
-	}
-
-	var analysisNeeded bool
-	switch mode {
-	case viz.WaveformMode:
-		analysisNeeded = len(p.audioModel.RawData) == 0
-	case viz.SpectrogramMode:
-		analysisNeeded = p.audioModel.FFTData == nil || len(p.audioModel.FFTData) == 0
-	case viz.TempoMode, viz.BeatMapMode:
-		analysisNeeded = len(p.audioModel.BeatData) == 0
-	}
-
-	// Get required data while holding lock
-	currentFile := p.currentFile
-	audioModel := p.audioModel
-	cancelChan := p.analysisCancel
-	p.mu.Unlock()
-
-	if !analysisNeeded {
-		return nil
-	}
-
-	// Do analysis outside lock
-	var err error
-	switch mode {
-	case viz.WaveformMode:
-		logDebug("Starting waveform analysis...")
-		err = audioModel.AnalyzeWaveform(
-			currentFile,
-			func(progress float64) {
-				p.updateAnalysisProgress(progress, "Analyzing waveform...")
-			},
-			cancelChan,
-		)
-		if err != nil {
-			return fmt.Errorf("waveform analysis failed: %w", err)
-		}
-
-	case viz.SpectrogramMode:
-		// First ensure we have waveform data
-		if len(audioModel.RawData) == 0 {
-			logDebug("Spectrum analysis requires waveform data, analyzing waveform first...")
-			err = audioModel.AnalyzeWaveform(
-				currentFile,
-				func(progress float64) {
-					p.updateAnalysisProgress(progress*0.5, "Preparing waveform data...")
-				},
-				cancelChan,
-			)
-			if err != nil {
-				return fmt.Errorf("waveform analysis failed: %w", err)
-			}
-		}
-
-		logDebug("Starting spectrum analysis...")
-		err = audioModel.AnalyzeSpectrum(
-			func(progress float64) {
-				p.updateAnalysisProgress(0.5+progress*0.5, "Computing frequency analysis...")
-			},
-			cancelChan,
-		)
-		if err != nil {
-			return fmt.Errorf("spectrum analysis failed: %w", err)
-		}
-
-	case viz.TempoMode, viz.BeatMapMode:
-		// Tempo analysis requires spectrum data
-		if audioModel.FFTData == nil || len(audioModel.FFTData) == 0 {
-			// First get waveform if needed
-			if len(audioModel.RawData) == 0 {
-				logDebug("Tempo analysis requires waveform data, analyzing waveform first...")
-				err = audioModel.AnalyzeWaveform(
-					currentFile,
-					func(progress float64) {
-						p.updateAnalysisProgress(progress*0.3, "Preparing waveform data...")
-					},
-					cancelChan,
-				)
-				if err != nil {
-					return fmt.Errorf("waveform analysis failed: %w", err)
-				}
-			}
-
-			// Then get spectrum
-			logDebug("Tempo analysis requires spectrum data, computing spectrum...")
-			err = audioModel.AnalyzeSpectrum(
-				func(progress float64) {
-					p.updateAnalysisProgress(0.3+progress*0.3, "Computing frequency analysis...")
-				},
-				cancelChan,
-			)
-			if err != nil {
-				return fmt.Errorf("spectrum analysis failed: %w", err)
-			}
-		}
-
-		logDebug("Starting tempo/beat analysis...")
-		err = audioModel.AnalyzeBeats(
-			func(progress float64) {
-				p.updateAnalysisProgress(0.6+progress*0.4, "Detecting beats and tempo...")
-			},
-			cancelChan,
-		)
-		if err != nil {
-			return fmt.Errorf("beat analysis failed: %w", err)
-		}
-
-	default:
-		return fmt.Errorf("unknown visualization mode: %d", mode)
-	}
-
-	p.mu.Lock()
-	p.analyzedFor[mode] = true
-	p.mu.Unlock()
-
-	logDebug("Analysis completed for mode: %s", getModeName(mode))
-	return nil
-}
-
-// Helper function for progress updates during analysis
-func (p *Processor) updateAnalysisProgress(progress float64, message string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if progress < 0 {
-		progress = 0
-	}
-	if progress > 1 {
-		progress = 1
-	}
-
-	elapsed := time.Since(p.status.StartTime)
-	var etaMsg string
-
-	if progress > 0 && progress < 1 {
-		totalEstimate := elapsed.Seconds() / progress
-		remaining := time.Duration((totalEstimate - elapsed.Seconds()) * float64(time.Second))
-		etaMsg = formatETA(remaining)
-	} else {
-		etaMsg = "calculating..."
-	}
-
-	p.status = ProcessingStatus{
-		State:     StateAnalyzing,
-		Message:   fmt.Sprintf("%s (ETA: %s)", message, etaMsg),
-		Progress:  progress,
-		CanCancel: true,
-		StartTime: p.status.StartTime,
-	}
-}
-
+// CancelProcessing cancels any ongoing analysis or load.
 func (p *Processor) CancelProcessing() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -420,6 +408,7 @@ func (p *Processor) CancelProcessing() {
 	}
 }
 
+// GetVisualization returns the current visualization output.
 func (p *Processor) GetVisualization() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -441,6 +430,7 @@ func (p *Processor) GetVisualization() string {
 	return p.vizManager.Render()
 }
 
+// HandleVisualizationInput processes key commands for visualization.
 func (p *Processor) HandleVisualizationInput(key string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -490,22 +480,24 @@ func (p *Processor) HandleVisualizationInput(key string) bool {
 			return true
 		}
 	}
-
 	return false
 }
 
+// GetStatus returns current loading/analysis state.
 func (p *Processor) GetStatus() ProcessingStatus {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.status
 }
 
+// GetMetadata returns the extracted metadata (if any).
 func (p *Processor) GetMetadata() *Metadata {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.metadata
 }
 
+// GetCurrentFile returns the raw audio data.
 func (p *Processor) GetCurrentFile() []byte {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -522,7 +514,39 @@ func getModeName(mode viz.ViewMode) string {
 		return "tempo"
 	case viz.BeatMapMode:
 		return "beatmap"
+	case viz.DensityMode:
+		return "density"
 	default:
 		return "unknown"
+	}
+}
+
+func (p *Processor) updateAnalysisProgress(progress float64, message string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > 1 {
+		progress = 1
+	}
+
+	elapsed := time.Since(p.status.StartTime)
+	var etaMsg string
+	if progress > 0 && progress < 1 {
+		totalEstimate := elapsed.Seconds() / progress
+		remaining := time.Duration((totalEstimate - elapsed.Seconds()) * float64(time.Second))
+		etaMsg = formatETA(remaining)
+	} else {
+		etaMsg = "calculating..."
+	}
+
+	p.status = ProcessingStatus{
+		State:     StateAnalyzing,
+		Message:   fmt.Sprintf("%s (ETA: %s)", message, etaMsg),
+		Progress:  progress,
+		CanCancel: true,
+		StartTime: p.status.StartTime,
 	}
 }

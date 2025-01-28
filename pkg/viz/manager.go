@@ -150,16 +150,16 @@ func (m *Manager) AddVisualization(mode ViewMode, viz Visualization) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Set total duration if available
-	if m.state.TotalDuration > 0 {
-		viz.SetTotalDuration(m.state.TotalDuration)
-	}
-
 	m.visualizations[mode] = viz
+	viz.SetTotalDuration(m.state.TotalDuration)
+}
 
-	// If this is our first visualization, set it as current
-	if len(m.visualizations) == 1 {
-		m.currentMode = mode
+func (m *Manager) SetTotalDuration(duration time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.state.TotalDuration = duration
+	for _, viz := range m.visualizations {
+		viz.SetTotalDuration(duration)
 	}
 }
 
@@ -180,4 +180,30 @@ func (m *Manager) SetMode(mode ViewMode) error {
 	}
 
 	return nil
+}
+
+func formatTimeAxis(duration time.Duration, width int) string {
+	var sb strings.Builder
+
+	// Calculate time steps
+	numSteps := 10
+	stepDuration := duration / time.Duration(numSteps)
+
+	for i := 0; i <= numSteps; i++ {
+		timestamp := stepDuration * time.Duration(i)
+		timeStr := formatDuration(timestamp)
+
+		// Calculate position
+		pos := (width * i) / numSteps
+		if i == 0 {
+			sb.WriteString(timeStr)
+		} else {
+			padding := pos - sb.Len()
+			if padding > 0 {
+				sb.WriteString(strings.Repeat(" ", padding))
+				sb.WriteString(timeStr)
+			}
+		}
+	}
+	return sb.String()
 }

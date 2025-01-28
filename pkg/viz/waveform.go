@@ -38,9 +38,21 @@ func (w *WaveformViz) Render(state ViewState) string {
 		return "No data for waveform."
 	}
 
-	var sb strings.Builder
+	// Actual duration from number of samples
+	actualDuration := time.Duration(float64(len(w.data)) / float64(w.sampleRate) * float64(time.Second))
+	if w.totalDuration == 0 || w.totalDuration < actualDuration {
+		w.totalDuration = actualDuration
+	}
 
-	// Always use full width
+	// Always clamp offset
+	if state.Offset < 0 {
+		state.Offset = 0
+	}
+	if state.Offset > w.totalDuration {
+		state.Offset = w.totalDuration
+	}
+
+	var sb strings.Builder
 	availWidth := state.Width
 	availHeight := state.Height - 4
 	if availHeight < 3 {
@@ -50,20 +62,35 @@ func (w *WaveformViz) Render(state ViewState) string {
 		availHeight = waveformMaxHeight
 	}
 
-	// Calculate samples per column based on zoom
-	samplesPerCol := int(float64(w.sampleRate) / float64(availWidth) / state.Zoom)
-	if samplesPerCol < 1 {
-		samplesPerCol = 1
+	// If zoom <= 1, we want the entire track visible at once => each col covers length(w.data)/availWidth
+	// If zoom > 1, we see a portion of track => samples per col = (len(w.data)/availWidth)*zoom
+	// But we invert it so that a bigger zoom means fewer columns per sample => we see less of the track
+	var spc float64
+	if state.Zoom <= 1.0 {
+		// entire track fits
+		spc = float64(len(w.data)) / float64(availWidth)
+	} else {
+		// user is zoomed in => we see only a fraction
+		spc = (float64(len(w.data)) / float64(availWidth)) * state.Zoom
+	}
+	if spc < 1 {
+		spc = 1
 	}
 
+	// Start sample
 	startSample := int(state.Offset.Seconds() * float64(w.sampleRate))
-	startSample = clamp(startSample, 0, len(w.data)-1)
+	if startSample < 0 {
+		startSample = 0
+	}
+	if startSample >= len(w.data) {
+		startSample = len(w.data) - 1
+	}
 
-	// Render timeline
-	sb.WriteString(w.renderTimeAxis(state))
+	// Timeline
+	sb.WriteString(w.renderTimeAxis(state, spc))
 	sb.WriteString("\n")
 
-	// Initialize display buffer
+	// Prepare buffer
 	display := make([][]string, availHeight)
 	for i := range display {
 		display[i] = make([]string, availWidth)
@@ -75,42 +102,47 @@ func (w *WaveformViz) Render(state ViewState) string {
 	centerY := availHeight / 2
 	style := lipgloss.NewStyle().Foreground(state.ColorScheme.Primary)
 
-	// For each column, find min and max amplitude
 	for x := 0; x < availWidth; x++ {
-		startIdx := startSample + (x * samplesPerCol)
-		if startIdx >= len(w.data) {
+		colStart := int(float64(startSample) + float64(x)*spc)
+		if colStart >= len(w.data) {
 			break
 		}
-
-		// Find min and max values for this column
-		var minVal, maxVal float64
-		for i := 0; i < samplesPerCol && (startIdx+i) < len(w.data); i++ {
-			val := w.data[startIdx+i]
-			if val < minVal {
-				minVal = val
-			}
-			if val > maxVal {
-				maxVal = val
-			}
+		colEnd := int(float64(colStart) + spc)
+		if colEnd > len(w.data) {
+			colEnd = len(w.data)
+		}
+		if colEnd <= colStart {
+			continue
 		}
 
-		// Scale to display height
-		minHeight := int((minVal / w.maxAmp) * float64(availHeight/2-1))
-		maxHeight := int((maxVal / w.maxAmp) * float64(availHeight/2-1))
+		minVal := 0.0
+		maxVal := 0.0
+		first := true
+		for i := colStart; i < colEnd; i++ {
+			val := w.data[i]
+			if first {
+				minVal = val
+				maxVal = val
+				first = false
+			} else {
+				if val < minVal {
+					minVal = val
+				}
+				if val > maxVal {
+					maxVal = val
+				}
+			}
+		}
+		minPix := int((minVal / w.maxAmp) * float64(availHeight/2-1))
+		maxPix := int((maxVal / w.maxAmp) * float64(availHeight/2-1))
 
-		// Draw the waveform
-		minY := centerY + minHeight
-		maxY := centerY + maxHeight
+		pixLow := clamp(centerY+minPix, 0, availHeight-1)
+		pixHigh := clamp(centerY+maxPix, 0, availHeight-1)
 
-		// Ensure proper boundaries
-		minY = clamp(minY, 0, availHeight-1)
-		maxY = clamp(maxY, 0, availHeight-1)
-
-		// Draw vertical line
-		for y := minY; y <= maxY; y++ {
+		for y := pixLow; y <= pixHigh; y++ {
 			if y == centerY {
 				display[y][x] = "─"
-			} else if y == minY || y == maxY {
+			} else if y == pixLow || y == pixHigh {
 				display[y][x] = "█"
 			} else {
 				display[y][x] = "│"
@@ -118,7 +150,7 @@ func (w *WaveformViz) Render(state ViewState) string {
 		}
 	}
 
-	// Render the display buffer
+	// Output buffer
 	for y := 0; y < availHeight; y++ {
 		for x := 0; x < availWidth; x++ {
 			if display[y][x] != " " {
@@ -130,9 +162,11 @@ func (w *WaveformViz) Render(state ViewState) string {
 		sb.WriteString("\n")
 	}
 
-	// Add control info
 	curTime := formatDuration(state.Offset)
 	totalTime := formatDuration(w.totalDuration)
+	if state.Offset > w.totalDuration {
+		curTime = totalTime
+	}
 	info := fmt.Sprintf(" Zoom: %.2fx | Position: %s/%s | ←/→: Scroll | +/-: Zoom | 0: Reset ",
 		state.Zoom, curTime, totalTime)
 	sb.WriteString(lipgloss.NewStyle().Foreground(state.ColorScheme.Text).Render(info))
@@ -140,27 +174,50 @@ func (w *WaveformViz) Render(state ViewState) string {
 	return sb.String()
 }
 
-func (w *WaveformViz) renderTimeAxis(state ViewState) string {
+func (w *WaveformViz) renderTimeAxis(state ViewState, spc float64) string {
 	var sb strings.Builder
-	visibleTime := w.totalDuration.Seconds() / state.Zoom
-	startTime := state.Offset.Seconds()
+
+	// The entire track length
+	actualDuration := time.Duration(float64(len(w.data)) / float64(w.sampleRate) * float64(time.Second))
+
+	// If zoom <= 1 => we see entire track from 0..end
+	// If zoom > 1 => we show offset.. offset + some portion
+	var startSec float64
+	var endSec float64
+
+	if state.Zoom <= 1.0 {
+		// Full track
+		startSec = 0
+		endSec = actualDuration.Seconds()
+	} else {
+		// user is zoomed in => we see offset.. portion
+		startSec = state.Offset.Seconds()
+		cols := float64(state.Width)
+		samplesSpan := cols * spc
+		durSpan := samplesSpan / float64(w.sampleRate)
+		end := startSec + durSpan
+		if end > actualDuration.Seconds() {
+			end = actualDuration.Seconds()
+		}
+		endSec = end
+	}
+
 	numMarkers := state.Width / 8
 	if numMarkers < 1 {
 		numMarkers = 1
 	}
-	timeStep := visibleTime / float64(numMarkers)
-
+	step := (endSec - startSec) / float64(numMarkers)
 	prevPos := -1
-	for i := 0; i < numMarkers; i++ {
-		timePos := startTime + (float64(i) * timeStep)
-		if timePos > w.totalDuration.Seconds() {
-			break
+
+	for i := 0; i <= numMarkers; i++ {
+		t := startSec + float64(i)*step
+		if t < 0 {
+			t = 0
 		}
-
-		timeStr := fmt.Sprintf("%02d:%02d",
-			int(timePos)/60,
-			int(timePos)%60)
-
+		if t > actualDuration.Seconds() {
+			t = actualDuration.Seconds()
+		}
+		label := fmt.Sprintf("%02d:%02d", int(t)/60, int(t)%60)
 		pos := int(float64(i) * float64(state.Width) / float64(numMarkers))
 		if pos <= prevPos {
 			continue
@@ -168,20 +225,26 @@ func (w *WaveformViz) renderTimeAxis(state ViewState) string {
 		prevPos = pos
 
 		if i == 0 {
-			sb.WriteString(fmt.Sprintf("%-8s", timeStr))
+			sb.WriteString(fmt.Sprintf("%-8s", label))
 		} else {
 			padding := pos - len(sb.String())
 			if padding > 0 {
 				sb.WriteString(strings.Repeat(" ", padding))
+				sb.WriteString(label)
 			}
-			sb.WriteString(timeStr)
 		}
 	}
 	return sb.String()
 }
 
 func (w *WaveformViz) SetTotalDuration(duration time.Duration) {
-	w.totalDuration = duration
+	// Compare with actual wave-based duration
+	actualDuration := time.Duration(float64(len(w.data)) / float64(w.sampleRate) * float64(time.Second))
+	if actualDuration > duration {
+		w.totalDuration = actualDuration
+	} else {
+		w.totalDuration = duration
+	}
 }
 
 func (w *WaveformViz) Name() string {
